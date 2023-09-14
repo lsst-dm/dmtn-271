@@ -13,128 +13,351 @@
 Abstract
 ========
 
-This technote proposes a new model for executing pipelines against butler repositories, in which quantum graphs are stored in the butler repository and the `pipetask` tool is ultimately replaced with a new command-line interface that uses a Quantum-backer for all execution.
+This technote proposes a new model for executing pipelines against butler repositories, in which both quantum graphs and output datasets are managed by a *butler workspace* before being committed back to the central data repository.
+Workspaces generalize the "quantum-backed butler" system (DMTN-177 :cite:`DMTN-177`) to all butler-backed execution with a more powerful and use-case-focused interface than the current ``pipetask`` tool.
+By storing quantum graphs in a butler-managed location, workspaces also pave the way to storing quantum provenance in butler.
 
-Introduction and related documents
-==================================
+Conceptual overview
+===================
 
-The design proposal here is in many respects a natural extension to :cite:`DMTN-177`, which addresses the database-contention problem with batch execution of pipelines against a SQL-backed butler client, by introducing a "quantum-backed butler" (QBB) that is backed by a quantum graph file.
-This gives batch execution via BPS a sequence of operations that is *almost* transactional:
+Origin in BPS/QBB
+-----------------
 
-1. "Begin" the run by generating a quantum graph and other downstream DAGs.
+The execution model of the Batch Production Service (BPS) with quantum-backed butler (QBB, see DMTN-177 :cite:`DMTN-177`) can be seen as three intuitive steps, analogous to transactional operations in SQL:
 
-2. "Execute" the run by calling `PipelineTask`` code, with file artifacts written to butler-managed locations.
+1. ``bps prepare`` starts the process defining a moderately large unit of processing processing, via a sequence of related directed acyclic graphs (DAGs), starting with the quantum graph.
+   These graphs and other WMS-specific files are saved to a "submit" directory, whose location is managed by the user even though the contents are managed by BPS.
+   This can be seen as the beginning of a transaction for a run - no modifications are made to the central data repository.
 
-3. "Commit" the run by inserting metadata about the already-written file artifacts to the central butler database.
+2. ``bps submit`` executes that processing by delegating to a third-party workflow management system (WMS).
+   All of these batch jobs (aside from the very last) write the output datasets as file artifacts, but do not read or write from the central data repository's database at all.
 
-The primary change proposed here is to make the first step a butler *write* operation, in which the quantum graph is saved to a location managed by the butler, in a format abstracted by the butler, but not as a simple datastore dataset; because quantum graph content provides metadata about file artifacts (similar to the role played by a SQL registry), we envision quantum graph storage to be managed by a new third butler component, which we will call the "workspace" (at least for now; naming is hard).
-One advantage of butler management of quantum graphs is that it would allow us to implement the missing piece of this execution model, "rollback" (deleting file artifacts instead of updating the database).  This would be a very useful for some development (as opposed to production) use cases, where the goal is to just get a `PipelineTask` working.
+3. The last batch job inserts records describing the produced file artifacts to the central database, effectively committing the transaction by putting all produced datasets into a single :attr:`~lsst.daf.butler.CollectionType.RUN` collection.
 
-While the QBB execution model (or something similar) is necessary for at-scale batch execution, it's also probably a more useful and intuitive interface for *all* execution, especially with rollback included, as the `pipetask` tool's current behavior w.r.t. collection chaining and failure recovery is often confusing to users.
-Having a single straightforward execution model (and interface) for both BPS and non-batch tools has also long been a goal for obvious reasons.
-Note that this is by definition a complete overhaul of the `pipetask` interface, and throughout this technote we will assume the transition will be best handled by introducing a new command-line interface via new `butler` subcommands, while `pipetask` as a whole is deprecated.
-A new command-line tool separate from `butler` would also be perfectly viable; our preference for `butler` subcommands is in no small part an attempt to avoid getting distracted by naming questions.
+These steps are not always visible to users - ``bps submit`` can run the ``prepare`` step itself, and usually does, and in the absence of errors the division between the regular execution batch jobs and the final "transfer" job is invisible.
+What matters is that this model provides a sound foundation for higher-level tools, with the existence of a discrete "commit" step the aspect that is most notably lacking in non-BPS execution.
 
-Unfortunately this execution model doesn't really fit well with the butler's current consistency model, in which a dataset is permitted to be present in  a datastore only if it is known to the associated registry - we explicitly and intentionally violate this rule during QBB execution before the "commit" occurs.
-Reworking the consistency model to permit QBB execution (and solve some other problems) is the primary goal of :cite:`DMTN-249`, by introducing a "journal file" concept for tracking datasets that have file artifacts but no central database records; this technote fleshes out the assertion in :cite:`DMTN-249` that a file or files representing a quantum graph would typically play that role during execution, with a necessary piece of this being the quantum graph being considered a part of the data repository.
+Workspace basics
+----------------
 
-The other major motivation for this technote is the need to implement some amount of butler quantum provenance.
-:cite:`DMTN-205` describes a schema for storing provenance the central database after execution is complete, which can be viewed as one possible way of storing quantum graph content in the central repository after an "execution transaction" has been committed.
-File-based storage is also an option, at least for some kinds of provenance queries, this is something we expect the butler interfaces to abstract over.
-In addition, the provenance picture is greatly simplified if the *predicted* quantum graph is always managed by butler instead of being left to the user; for the most rigorous provenance we want butler to have complete chain of custody of the graph from its inception.
+The middleware team has long wanted to unify the ``bps`` and ``pipetask`` interfaces, and the proposal here is to do just that, by introducing a new *workspace* concept that generalizes the BPS/QBB flow to all execution.
+A workspace is best thought of an under-construction, uncommitted :attr:`~lsst.daf.butler.CollectionType.RUN` collection, known to the central data repository but not included in its databases (except perhaps as a lightweight record of which workspaces exist).
+Users interact with a workspace via a :class:`WorkspaceButler` client, which subclasses :class:`~lsst.daf.butler.LimitedButler`.
+When a workspace is committed a regular :attr:`~lsst.daf.butler.CollectionType.RUN` collection is created and the workspace ceases to exist.
+Workspaces can hold quantum graphs, output file artifacts (via a datastore), and provenance/status information.
 
-.. _pipeline-execution-model:
+Workspaces can have multiple implementations and capabilities.
+:class:`WorkspaceButler` itself will not assume anything about tasks or pipelines, as appropriate for a class defined in ``daf_butler``.
+Our main focus here will be a :class:`PipelineWorkspaceButler` subclass that serves as a ``pipetask`` replacement, and we imagine it storing its persistent state (mostly quantum graphs) using files.
+Whether those files are managed by a prediction-mode datastore or something else (e.g. direct use of :class:`~lsst.resources.ResourcePath` and probably some datastore support tooling, like the file template system) is an implementation detail
+Implementations with similar capabilities that use scalable NoSQL databases for persistent state should also be possible (but it is not obvious that this will be necessary).
+We envision BPS and its plugins delegating to the :class:`PipelineWorkspaceButler` via a command-line interface, much as they currently do with ``pipetask``, but we hope that eventually the front-end interface to BPS could be a :class:`WorkspaceButler` subclass as well.
 
-Pipeline execution model
-========================
+Workspaces *may* read from the central repository database for certain operations after they are created, but they must not write to it except when committed, and it is expected that many core operations will not access the central database at all (such as actually running tasks with :meth:`PipelineWorkspaceButler.run_quanta`).
 
-Overview
---------
+Provenance
+----------
 
-We are focused on satisfying three primary pipeline execution use cases:
-
-- Batch production, in which software and configuration is *mostly* frozen, and ``RUN`` collections are the natural atomic unit: there is one quantum graph, one batch workflow, and one transfer job for each ``RUN`` collection.
-  Each of these RUN collections typically corresponds to a shard (one of several disjoint sets of data IDs that together span the full campaign) of a step (one of several disjoint subgraphs of the full pipeline).
-
-- Prompt processing, in which software and configuration are also frozen, but there is one ``RUN`` collection (typically) for each night of observing, with a new *logical* quantum graph for each observation (typically a ``visit`` or ``{visit, detector}`` combination), and it may not even be possible to instantiate each *logical* quantum graph up front, because of the need to start each step of processing as soon as possible.
-
-- Pipeline software development, in which software and configuration are very much in flux, but the output data products don't need to be retained (at least not in the long term) and hence provenance loss is acceptable.
-
-Only the first of these is fully compatible with the approximate begin/execute/commit sequence used already by BPS with QBB, in which quantum graph generation represents the "begin" step and each ``RUN`` collection is more or less atomic.
-Prompt processing requires support for executing and committing results for some data IDs (e.g. one visit) before executing and committing those of another (e.g. the next visit), all within the same ``RUN`` collection.
-And software development use cases prevent us from (always) freezing software and pipeline definitions at transaction start, let alone quantities derived from them, like the quantum graph.
-But this isn't actually a problem, as these do not present any obstacle to the important conceptual change here, which is that records representing output datasets are only inserted into the central database after all quanta in a graph have been processed, but these datasets are tracked in other ways prior to this and are fully managed by the butler throughout.
-
-Our execution model will instead define its "begin" analog to be the creation of a new *workspace collection*, with initial datasets describing only the pipeline, software versions, and input collections.
-Workspace collections are not queryable until they are committed, which turns them into ``RUN`` collections.
-
-Our "execute" stage will be split several incremental steps:
-
-- declaring the tasks from the already-provided pipeline that will actually be run (and writing their init-output datasets);
-- building the quantum graph, by providing data ID constraints;
-- actually running tasks.
-
-These generally have to be performed in this order, but some exceptions are quite useful and should not be hard to implement.
-
-The "commit" stage is simple: the workspace collection is transformed into a ``RUN`` collection, and the records for its datasets (both registry and datastore) are inserted into the central database.
-A CHAINED collection may optionally be created or modified to include the new ``RUN`` collection at the same time.
-
-The "rollback" stage is even simpler: the workspace collection and all of its contents are deleted.
-
-It should be emphasized that these are *conceptual* stages that are most meaningful for lower-level code and reasoning about data repository consistency.
-For convenience, high-level interfaces will often permit many steps to be performed together (see :ref:`user-interface`).
-
-External workspaces
--------------------
-
-We actually have a fourth use case we'd like to support: science users running pipelines in the Rubin Science Platform.
-We don't have a good sense for what storage systems these users would be writing file artifacts to, but we *do* want to limit the degree to which the client-server butler needs to support direct execution.
-
-With that in mind, we envision permitting a workspace collection to be created its own datastore root in a location controlled by the user.
-This opens up two options for committing the workspace:
-
-- output file artifacts could be transferred back to the central data repository;
-- a new (typically SQLite) data repository could be created from the workspace collection's contents in the external workspace's root.
-
-The latter is a limited form of data repository chaining, with the main limitations being:
-
-- input datasets from the central data repository could at best be ingested into the new repo as external artifacts (i.e. with absolute URIs), and even then only if the central database can promise that they will never be deleted over the lifetime of the satellite data repository;
-- it is not clear we can support queries or quantum-graph generation for subsequent processing that requires inputs from both the satellite and the central data repository - this is the classic registry-chaining problem, and while I am more optimistic about it than I was in the past, it is not something we want to promise right now.
-
-External workspaces should be implemented such that "rollback" is exactly the same as deleting the directory containing the workspace; users *will* do this and it will be easier for all involved if we make it a well-defined, legal operation rather than something that involves any kind of administrative recovery.
-
-Sharding
---------
-
-To support the prompt-processing use case, we need to permit quantum-graph generation to be run multiple times on multiple disjoint sets of data IDs, and allow each of these sets of data IDs to be committed separately.
-To do this, a workspace collection may be initialized with a set of *sharding dimensions*, which will restrict the tasks that can be run in that workspace to only those for which sharding by those dimensions defines disjoint partition of all quanta, and require that all quantum-graph generation invocations provide values for those dimensions explicitly.
-Sharded workspace collections may coexist with the ``RUN`` collections they eventually become for a time, but any data ID identifying the sharding dimensions is strictly in one or the other.
-
-A workspace collection will not be queryable in the same way as a regular, completed ``RUN`` collections, which is what a workspace collection will become when it is committed; in the future we may be able to provide some limited, opt-in support for querying collections in this state, but at first most queries will not be supported at all.
-The initial datasets are stored only as file artifacts, using a prediction-mode datastore, and the ``packages`` dataset is optional: not writing it will put the workspace in *development* mode, in which provenance-unfriendly operations are permitted and the provenance that is saved is marked as unreliable.
-At this stage we will store the full pipeline, not just the subset of tasks being run.
-Adding the workspace collection itself may involve the insertion of records into the database and/or files being written to a file-storage location defined by data repository configuration entries (see :ref:`workspace-apis-and-implementations`).
-
-It is possible that sharding could also be useful for data-release batch production as well, but the current Campaign Management approach prefers to put *its* shards in different ``RUN`` collections anyway.
-It may still be useful to define workspace collections with sharding dimensions even when each one only contains one shard (of many data IDs), simply to guard against accidentally running tasks incompatible with those sharding dimensions.
+One clear advantage of the workspace model is that the "commit" step provides an opportunity for provenance to be gathered and possibly rewritten into a form more focused on post-execution reads than at-scale execution writes.
+This is a problem largely ignored by DMTN-205 :cite:`DMTN-205`, which describes a central database schema for provenance but lacks a complete plan for populating it.
+In addition to the workspace interfaces, this technote will describe new methods on the :class:`~lsst.daf.butler.Butler` class that provide some provenance query support.
+These could be implemented by storing quantum graphs and quantum status in files after workspaces are committed, while leaving room for database storage of provenance graphs as described in DMTN-205 :cite:`DMTN-205` in the future.
 
 Development mode
 ----------------
 
-A workspace collection may be initialized in *development mode*.
-This will cause the software versions to not be written out at all, and other output datasets (including collection-wide datasets like pipeline definition datasets, configs, and task init-outputs) will frequently be overwritten.
-When committed, some provenance from a development workspace collection may be dropped, and the rest will be marked as unreliable.
-Note that cannot just always roll back a development workspace collection because being able to test downstream tasks (which may require making new quantum graphs in new workspaces) is an important part of development work.
+Workspaces would also be useful in pipeline software development and small-scale testing, especially if we could (sometimes) relax our consistency controls on software versions and pipeline configuration prior to "commit", a state we will call "developement mode".
+Furthermore, many development runs would not be committed at all, because the data products themselves are not the real outcome of that work - working code is.
+This suggests that workspaces should also support an analog of SQL's ``ROLLBACK`` as an alternative to commit (though we will use :meth:`WorkspaceButler.abandon` as the nomenclature here to avoid confusion with the very different relationship between ``commit`` and ``rollback`` in other contexts, e.g. some version control systems).
 
-.. _user-interface:
+External workspaces
+-------------------
 
-User interface
+If we provide an option to create a workspace in an external location instead of inside a central data repository, we get an intriguing possibility for execution in the Rubin Science Platform (RSP) or on a science user's local compute resources.
+The quantum graph stored in the workspace knows about all needed input datasets, and these could be transferred to the external location as well, providing a self-contained proto-data-repository that could be manually moved and ultimately executed anywhere, and it contains all of the information needed to reconstitute a standalone data repository with its own database.
+Alternatively, if the workspace is left in a location where it can read from the central data repository but not write to it, input datasets could be left in the central data repository and the user could choose to either create a standalone repository that merely references them or commit by transferring output dataset file artifacts to the cental repository root.
+
+Sharded workspaces and Prompt Processing
+----------------------------------------
+
+We have one major use case that does not fit as well with this model, at leas as described so far: prompt processing runs one ``visit`` or one ``{visit, detector}`` at a time, appending these results to a single :attr:`~lsst.daf.butler.CollectionType.RUN` collection that typically covers an entire night's processing.
+The switch from ``pipetask`` to workspaces wouldn't actually *require* any major changes to the prompt processing framework's architecture, because each prompt processing worker has its own full SQL-backed butler, with the fan-out to workers and long-term persistence represented as transfers between data repositories.
+Workspaces would be created and committed wholly within individual workers,  requiring some minor API changes to low-level tooling like :class:`~lsst.ctrl.mpexec.SeparablePipelineExecutor`, but no more.
+
+An alternative approach in which workspaces are more tightly integrated with prompt processing is both intriguing and more disruptive.
+In this model, prompt processing would have a custom :class:`WorkspaceButler` implementation that represents a client of a central-butler workspace existing on a worker node.
+This would give prompt-processing complete control over quantum graph generation and how it is interleaved with execution, allowing the graph to be built incrementally as new information (first the ``nextVisit`` event, then a ``raw`` file artifact, and then perhaps a ``raw`` for a second stamp), with each processing step starting as soon as possible.
+There would be no SQL database on the workers at all, and the :class:`WorkspaceButler` implementation would implement its own :meth:`~lsst.daf.butler.LimitedButler.get` and :meth:`~lsst.daf.butler.LimitedButler.put` implementations for use by tasks.
+This would be a natural place to put in-memory caching of datasets, while delegating to a regular :class:`~lsst.daf.butler.Datastore` when actual file I/O is desired.
+
+This model would not work if a :attr:`~lsst.daf.butler.CollectionType.RUN` collection is the (only) unit for commits and quantum graph generation, since we would want to commit results from each worker to the central butler on a per-data ID basis.
+To address this, a workspace may be created with *sharding dimensions*, which define data IDs that may be committed independently.
+This restricts the tasks that may be run in such a workspace to those that have at least those dimensions, ensuring that all output datasets in the workspace can be divided into disjoint sets according to those data IDs.
+Committing a data ID from a sharded workspace moves all datasets and provenance with that data ID to the corresponding :attr:`~lsst.daf.butler.CollectionType.RUN` collection in the central repo, removing it from the workspace (note that file artifacts remain where they are unless this is an external workspace), allowing the :attr:`~lsst.daf.butler.CollectionType.RUN` collection and its workspace to coexist for a while.
+
+Sharded workspaces may be also useful for data release production campaign management.
+Our current campaign management tooling prefers to do its own sharding, resulting in different :attr:`~lsst.daf.butler.CollectionType.RUN` collection for each shard (where a shard is typically hundreds or thousands of data IDs), and this model will continue to be viable and probably preferred due to the simplicity of one-to-one correspondence between :attr:`~lsst.daf.butler.CollectionType.RUN` collections (and in the future, workspaces) and batch submissions.
+Sharding within a workspace just gives us another option, and declaring sharding dimensions with the current campaign management sharding approach still has the advantage of restricting tasks in exactly the way we'd like to guard against bad pipeline step definitions and operator error.
+
+An unsharded workspace logically has empty sharding dimensions, and one shard identified by the empty data ID.
+It permits all tasks since the set of empty dimensions is a subset of all dimension sets.
+
+Data repository consistency
+---------------------------
+
+A serious but often ignored problem with QBB (and its predecessor, "execution butler") is that it is inconsistent with the nominal butler consistency model, in that it allows file artifacts to exist in a datastore root without having any record of those artifacts in the corresponding registry.
+This consistency model is only "nominal" because it was never actually sound (deletions in particular have always been a problem), and hence we've considered it an acceptable casualty when working to limiting database access during execution (i.e. DMTN-177 :cite:`DMTN-177`).
+DMTN-249 :cite:`DMTN-249` attempts to address this issue by defining a new consistency model that explicitly permits (and actually requires) file artifacts to exist prior to their datasets' inclusion in the registry, as long as those datasets are tracked as *possibly* existing in some other way that allows them to be found by any client of the central data repository (not merely, e.g. one that knows the user-provided location of an external quantum graph file, as is the case today).
+The workspace concept described here is a realization of this new consistency model: the central data repository will have a record of all active (internal) workspaces (probably in a registry database table) and its full butler clients will have the ability to construct a :class:`WorkspaceButler` for these by name, and a workspace is required to support the :meth:`WorkspaceButler.abandon` operation, which effectively requires that it have a way to find all of its file artifacts.
+
+Concurrency and workspace consistency
+-------------------------------------
+
+Different workspaces belonging to the same central data repository are fully independent, and may be operated on concurrently in different processes with no danger of corruption.
+This includes commits and workspace creation, and races for creation of the same workspace should result in at least one of the two attempts explicitly failing, and no danger of an incorrect workspace being silently created.
+
+Operations on workspaces should be idempotent either by being atomic or by being resumable from a partial state after interruption, with exceptions to this rule clearly documented.
+
+*Most* operations on a workspaces are not expected to support or guard against concurrent operations on the same workspace, unless they are operating on disjoint sharding data IDs, in which case concurrency is required of all sharding workspace implementations.
+In addition, some workspace-specific interfaces are expected to explicitly support concurrency under certain conditions; this is, after all, much of the reason we require workspaces to avoid central database access whenever possible.
+Most prominent of these is the :meth:`PipelineWorkspaceButler.run_quanta` method, which guarantees correct behavior in the presence of concurrent calls as long as those calls identify disjoint sets of quanta to run, allowing it to be used as an execution primitive by higher-level logic capable of generating those disjoint sets (e.g. BPS).
+
+In fact, we will define :meth:`PipelineWorkspaceButler.run_quanta` to *block* when it is given a quantum whose inputs are produced by other quanta that have not been run.
+This is possible because this workspace implementation will also record quantum status (e.g. in per-quantum report files) for provenance, and we can modify the single-quantum execution logic to wait (e.g. for these files) to appear upstream.
+This actually addresses a possible soundness problem in our current execution model: :class:`~lsst.resources.ResourcePath` backends other than POSIX and S3 may not guarantee that an output file artifacts write will propagate to all servers by the time a read or existence check is performed on a downstream node, let alone by the time the write call returns, and we think we've seen this problem in some WebDAV storage in the past.
+With our current approach to execution this can result in silently incorrect execution, because the dataset will be assumed to have been not produced and may be ignored by the downstream.
+
+Phasing out prediction-mode datastore
+-------------------------------------
+
+Allowing file datastore to operate in "prediction mode" (where a datastore client assumes datasets were written with the same formatters and file templates it is configured to use) was a necessary part of getting QBB working.
+With workspaces, we hope to retire it, by saving datastore records along with the quantum status information the workspace will already be required to store, and which downstream quanta will be required to read.
+This will allow us to simplify the datastore code and eliminate existence checks both during execution and when committing a quantum-graph-based workflow back to the central data repository.
+
+Pipeline workspace actions
+--------------------------
+
+Creating a new pipeline workspace will not require that the quantum graph be produced immediately, though this will be a convenience operation (combining all of the steps described below) we expect to be frequently exercised.
+Instead, only the pipeline must be provided up-front, and even that can be overwritten in development mode.
+Tasks within that pipeline are activated next, which writes their init output file artifacts to the workspace (note that this now happens before a quantum graph is built).
+Quanta can then be built, shard-by-shard; the workspace will remember which shards have quanta already.
+Even executed quanta are not immutable until the workspace is committed - :class:`PipelineWorkspaceButler` will provide methods for quantum state transitions, like resetting a failed quantum so it can be attempted again.
+
+Development mode will provide much more flexibility in the order these steps these can be performed, generally by resetting downstream steps and allowing output dataset to be clobbered.
+
+.. _new-interfaces:
+
+New interfaces
 ==============
 
-.. _workspace-apis-and-implementations:
+Workspace construction and completion (``daf_butler``)
+------------------------------------------------------
 
-Workspace APIs and implementations
-==================================
+Workspaces are expected to play a central role in the DMTN-249 :cite:`DMTN-248` consistency model, in which file artifacts are written prior to the insertion of their metadata into the database, but only after some record is made in the central repository that those artifacts *may* exist.
+This means workspace construction and removal operations need to be very careful about consistency in the presence of errors and concurrency.
+This is complicated by the fact that workspaces are extensible; all concrete implementations will live downstream of `lsst.daf.butler`.
+
+We envision workspace creation to be aided by two helper classes that are typically defined along with a new :class:`WorkspaceButler` implementation:
+
+- A :class:`WorkspaceFactory` is a callable that creates a new workspace from a full butler and some standard user-provided arguments, returning a :class:`WorkspaceButler` instance and a :class:`WorkspaceConfig` instance.
+- :class:`WorkspaceConfig` is a pydantic model that records all state needed to make a new :class:`WorkspaceButler` client to an existing workspace, with a method to create a :class:`WorkspaceButler` from that state.
+
+After a factory is used to write rest of the workspace's initial state, the configuration is written to a JSON file in a predefined (by a URI template in the central repository butler configuration) location.
+This file is read and used to make a new :class:`WorkspaceButler` instance without requiring access to the full butler.
+
+This is all driven by a :meth:`~Butler.make_workspace` method on the full :class:`~lsst.daf.butler.Butler` class, for which the prototyping here includes a nominal implementation with detailed comments about how responsibility (especially for error-handling) is shared by different methods.
+
+After an internal workspace has been created, a client :class:`WorkspaceButler` can be obtained from a full :class:`Butler` to the central repository by calling :meth:`Butler.get_workspace`, or without ever making a full butler by calling :meth:`ButlerConfig.make_workspace_butler`.
+External workspace construction goes through :meth:`WorkspaceButler.make_external`.
+
+We expect most concrete workspace implementations to define a ``butler`` subcommand for their creation, and for most end users to interact only with that command-line interface.
+
+Committing a workspace goes through :meth:`WorkspaceButler.commit`, and abandoning one goes through :meth:`WorkspaceButler.abandon`.
+Creating a new standalone repository goes through :meth:`WorkspaceButler.export`.
+All of these have nominal implementations in the prototype, showing that they delegate to many of the same abstract methods to transfer their content to full butlers and remove anything that remains from the workspace.
+
+Quantum graph and provenance queries (``daf_butler``)
+-----------------------------------------------------
+
+This technote includes a simplified (relative to :cite:`DMTN-205`) proposal for provenance querying on the full butler, primarily because :class:`PipelineWorkspaceButler` will require major changes to the :class:`QuantumGraph` class, and it makes sense to include changes directed at using the same class (or at least a common base class) to report provenance to avoid yet another round of disruption.
+
+The entry point is :meth:`Butler.query_provenance`, which delegates much of its functionality to a new parsed string-expression language, represented here by the :class:`QuantumGraphExpression` placeholder class.
+I am quite optimistic that this will actually be pretty easy to implement, with one important caveat: we do not promise to efficiently resolve these expressions against large (let alone unbounded) sequences of collections, allowing us to implement expression resolution by something as simple as reading per-collection quantum-graph files into memory and calling `networkx <https://networkx.org/documentation/stable/index.html>`__ methods.
+A moderately complex expression could look something like this::
+
+   isr..(..warp@{tract=9813, patch=22, visit=1228} | ..warp@{tract=9813, patch=22, visit=1230})
+
+which evaluates to "all quanta and datasets downstream of the ``isr`` task that are also upstream of either of two particular ``warp`` datasets".
+The standard set operators have their usual meanings, and ``..`` is used (just as in the butler data ID query language) to specify ranges.
+In the context of a DAG, half-open ranges mean :py:func:`ancestors <networkx.algorithms.dag.ancestors>` or :py:func:`descendants <networkx.algorithms.dag.descendants>`, while::
+
+   a..b
+
+is a shortcut for::
+
+   a.. & ..b
+
+The return type is the new :class:`QuantumGraph`, which has very little in common with its :class:`lsst.pipe.base.QuantumGraph` predecessor in terms of its Python API, though of course they are conceptually very similar.
+They may have more in common under the hood, especially with regards to serialization.
+Major differences include:
+
+- It does not attempt to hold task or config information, which makes it easier to put the class in ``daf_butler`` (where it needs to be for :meth:`Butler.query_provenance`).
+  Instead it just has string task labels that can be looked up in a :class:`~lsst.pipe.base.Pipeline` or :class:`~lsst.pipe.base.pipeline_graph.PipelineGraph`, which are stored as regular butler datasets in the same :attr:`~lsst.daf.butler.CollectionType.RUN` collection as the quanta they correspond to.
+
+- Its interface is designed to allow implemenations to load the the :class:`~lsst.daf.butler.DataCoordinate` and :class:`~lsst.daf.butler.DatasetRef` information associated with a node only on demand.
+  Our profiling has shown that saving and loading that information constitutes the vast majority of the time it takes to serialize and deserialize graphs, and we want to give future implementations to simply not do a lot of that work unless it's actually needed.
+  We expect a lot of provenance use cases to involve traversing a large graph but only requiring details about a small subset of the nodes.
+
+- It records status for each node via the new :class:`QuantumStatus` and :class:`DatasetStatus` enums.
+  These are not intended to provide human-readable error reports - this is a known gap in this proposal I'd like to resolve later - but they do provide a sufficiently rich set of states to represent human-driven *responses* to errors during processing as state transitions (e.g. :meth:`PipelineWorkspaceButler.accept_failed_quanta`, :meth:`~PipelineWorkspaceButler.poison_successful_quanta`, and :meth:`~PipelineWorkspaceButler.reset_quanta`), as well as a way to record those responses in provenance.
+
+- Many of the current :class:`lsst.pipe.base.QuantumGraph` accessors are missing, having been replaced by a *bipartite* :class:`networkx.MultiDiGraph` accessor that includes nodes for datasets as well as quanta.
+  Some of these may return as convenience methods for particularly common operations, but I like the idea of embracing the `networkx <https://networkx.org/documentation/stable/index.html>`__ graphs as the primary interface, having grown quite fond of them while working on :class:`~lsst.pipe.base.pipeline_graph.PipelineGraph`.
+
+- In order to be suitable for provenance query results that can span collections, a particular :class:`QuantumGraph` instance is not longer restricted to a single :attr:`~lsst.daf.butler.CollectionType.RUN` collection
+
+The prototype here defines :class:`QuantumGraph` as an ABC, which may or may not be ultimately necessary.
+It may be that a single implementation could satisfy all quantum-oriented concrete workspaces as well as :meth:`Butler.query_provenance`.
+
+Pipeline workspace (``pipe_base``)
+----------------------------------
+
+.. _prototype-code:
+
+Prototype code
+==============
+
+This technote's git repository includes two Python files with stubs representing new interfaces for the ``daf_butler`` and ``pipe_base`` packages.
+These can be inspected directly, but the most important parts are included here so classes and methods can be referenced by the preceding sections.
+This occasionally includes proto-implementations, but only when these are particularly illustrative of the relationships between interfaces.
+
+daf_butler
+----------
+
+.. py:class:: WorkspaceFactory
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: WorkspaceFactory
+
+.. py:class:: WorkspaceConfig
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: WorkspaceConfig
+
+.. py:class:: Butler
+
+   .. py:method:: make_workspace
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: Butler.make_workspace
+
+   .. py:method:: get_workspace
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: Butler.make_workspace
+
+   .. py:method:: query_provenance
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: Butler.query_provenance
+
+.. py:class:: ButlerConfig
+
+   .. py:method:: make_workspace_butler
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: ButlerConfig.make_workspace_butler
+
+.. py:class:: WorkspaceButler
+
+   .. py:method:: make_external
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: WorkspaceButler.make_external
+
+   .. py:method:: abandon
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: WorkspaceButler.abandon
+
+   .. py:method:: commit
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: WorkspaceButler.commit
+
+   .. py:method:: export
+
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: WorkspaceButler.commit
+
+.. py:class:: QuantumGraphExpression
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: QuantumGraphExpression
+
+.. py:class:: QuantumGraph
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: QuantumGraph
+
+.. py:class:: QuantumStatus
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: QuantumStatus
+
+.. py:class:: DatasetStatus
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: DatasetStatus
+
+
+pipe_base
+---------
+
+.. py:class:: PipelineWorkspaceButler
+
+   .. py:method:: run_quanta
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.run_quanta
+
+   .. py:method:: accept_failed_quanta
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.accept_failed_quanta
+
+   .. py:method:: poison_successful_quanta
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.poison_successful_quanta
+
+   .. py:method:: reset_quanta
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.reset_quanta
+
+
+
+References
+==========
 
 .. rubric:: References
 
