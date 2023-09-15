@@ -48,9 +48,7 @@ Workspaces can hold quantum graphs, output file artifacts (via a datastore), and
 
 Workspaces can have multiple implementations and capabilities.
 :class:`WorkspaceButler` itself will not assume anything about tasks or pipelines, as appropriate for a class defined in ``daf_butler``.
-Our main focus here will be a :class:`PipelineWorkspaceButler` subclass that serves as a ``pipetask`` replacement, and we imagine it storing its persistent state (mostly quantum graphs) using files.
-Whether those files are managed by a prediction-mode datastore or something else (e.g. direct use of :class:`~lsst.resources.ResourcePath` and probably some datastore support tooling, like the file template system) is an implementation detail
-Implementations with similar capabilities that use scalable NoSQL databases for persistent state should also be possible (but it is not obvious that this will be necessary).
+Our main focus here will be a :class:`PipelineWorkspaceButler` subclass that serves as a ``pipetask`` replacement, and we imagine it storing its persistent state (mostly quantum graphs) using files (see :ref:`implementation-notes`).
 We envision BPS and its plugins delegating to the :class:`PipelineWorkspaceButler` via a command-line interface, much as they currently do with ``pipetask``, but we hope that eventually the front-end interface to BPS could be a :class:`WorkspaceButler` subclass as well.
 
 Workspaces *may* read from the central repository database for certain operations after they are created, but they must not write to it except when committed, and it is expected that many core operations will not access the central database at all (such as actually running tasks with :meth:`PipelineWorkspaceButler.run_quanta`).
@@ -145,15 +143,15 @@ Even executed quanta are not immutable until the workspace is committed - :class
 
 Development mode will provide much more flexibility in the order these steps these can be performed, generally by resetting downstream steps and allowing output dataset to be clobbered.
 
-.. _new-interfaces:
+.. _python-components-and-interfaces:
 
-New interfaces
-==============
+Python components and operation details
+=======================================
 
 Workspace construction and completion (``daf_butler``)
 ------------------------------------------------------
 
-Workspaces are expected to play a central role in the DMTN-249 :cite:`DMTN-248` consistency model, in which file artifacts are written prior to the insertion of their metadata into the database, but only after some record is made in the central repository that those artifacts *may* exist.
+Workspaces are expected to play a central role in the DMTN-249 :cite:`DMTN-249` consistency model, in which file artifacts are written prior to the insertion of their metadata into the database, but only after some record is made in the central repository that those artifacts *may* exist.
 This means workspace construction and removal operations need to be very careful about consistency in the presence of errors and concurrency.
 This is complicated by the fact that workspaces are extensible; all concrete implementations will live downstream of `lsst.daf.butler`.
 
@@ -176,6 +174,12 @@ Committing a workspace goes through :meth:`WorkspaceButler.commit`, and abandoni
 Creating a new standalone repository goes through :meth:`WorkspaceButler.export`.
 All of these have nominal implementations in the prototype, showing that they delegate to many of the same abstract methods to transfer their content to full butlers and remove anything that remains from the workspace.
 
+To make exporting and external workspaces more useful, :meth:`WorkspaceButler.transfer_inputs` may be used to transfer the file artifacts of input datasets used by the workspace into the workspace itself.
+This may allow the external workspace (depending on its implementation) to be used after fully severing its connection to the central data repository (e.g. copying it to a laptop).
+These datasets are also included in the standalone data repository created by :meth:`WorkspaceButler.export`.
+
+.. _quantum-graph-and-provenance-queries:
+
 Quantum graph and provenance queries (``daf_butler``)
 -----------------------------------------------------
 
@@ -189,7 +193,7 @@ A moderately complex expression could look something like this::
 
 which evaluates to "all quanta and datasets downstream of the ``isr`` task that are also upstream of either of two particular ``warp`` datasets".
 The standard set operators have their usual meanings, and ``..`` is used (just as in the butler data ID query language) to specify ranges.
-In the context of a DAG, half-open ranges mean :py:func:`ancestors <networkx.algorithms.dag.ancestors>` or :py:func:`descendants <networkx.algorithms.dag.descendants>`, while::
+In the context of a DAG, half-open ranges mean :func:`ancestors <networkx.algorithms.dag.ancestors>` or :func:`descendants <networkx.algorithms.dag.descendants>`, while::
 
    a..b
 
@@ -219,8 +223,108 @@ Major differences include:
 The prototype here defines :class:`QuantumGraph` as an ABC, which may or may not be ultimately necessary.
 It may be that a single implementation could satisfy all quantum-oriented concrete workspaces as well as :meth:`Butler.query_provenance`.
 
+How to handle the *storage* of committed quantum graphs is a question this technote does not attempt to fully answer.
+The best answer probably involves a new registry "manager" interface and implementation, despite this implying the introduction of file-based storage to the registry (for the implementation we imagine doing first; a database-graph-storage option as in :cite:`DMTN-205` should be possible as well, if we find we need it).
+We want changing the quantum graph storage format to be tracked as a repository migration, and using the registry manager paradigm is our established way of doing that.
+Storing quantum graph content in database blob columns may be another good first-implementation option; this still saves us from having to fully map the quantum graph data structure to tables, while still allowing us to pull particularly useful/stable quantities into separate columns.
+
 Pipeline workspace (``pipe_base``)
 ----------------------------------
+
+The :class:`PipelineWorkspaceButler` that defines the new interface for low-level task execution has been prototyped here as an ABC living in ``pipe_base``.
+We could implement this ABC fully in ``ctrl_mpexec`` using modified versions of tools (e.g. :class:`~lsst.ctrl.mpexec.SingleQuantumExecutor`) already defined there, but it may also make sense to move most or all of the implementation to ``pipe_base``, perhaps leaving only :mod:`multiprocessing` execution to ``ctrl_mpexec`` while implementing serial, in-process execution in ``pipe_base``.
+Even if the base class ends up concrete and capable of simple multiprocessing, I do expect it to support subclassing for specialized pipeline execution contexts (BPS, prompt processing, mocking), though composition may also be an option for these.
+
+A :class:`PipelineWorkspaceButler` is initialized with a :class:`~lsst.pipe.base.Pipeline` or :class:`~lsst.pipe.base.pipeline_graph.PipelineGraph`, and at construction it stores these and (usually) the software versions currently in use as datasets (with empty data IDs) to the workspace.
+Getter methods (:meth:`~PipelineWorkspaceButler.get_pipeline`, :meth:`~PipelineWorkspaceButler.get_pipeline_graph`, :meth:`~PipelineWorkspaceButler.get_packages`) provide access to the corresponding in-memory objects (these are not properties because they may do I/O).
+
+A pipeline workspace can be initialized in or converted (irreversibly) to :attr:`~PipelineWorkspaceButler.development_mode`, which disables the saving of pipeline versions.
+The pipeline associated with the workspace may be :meth:`reset <PipelineWorkspaceButler.reset_pipeline>` only in development mode.
+Committing a development-mode pipeline workspace does not save provenance or configs to the central repository, because it is in general unreliable.
+Often development-mode workspaces will ultimately be abandoned instead of committed.
+
+After initialization, pipeline workspace operations proceed in roughly three stages:
+
+1. Tasks are *activated*, which writes their init-outputs (including configs) to the workspace and marks them for inclusion (by default) in the next step.
+   :meth:`~PipelineWorkspaceButler.activate_tasks` may be called multiple times as long as the order of the calls is consistent with the pipeline graph's topologicial ordering.
+   Init-input and init-output dataset references are accessible via :meth:`~PipelineWorkspaceButler.get_init_input_refs` and :meth:`~PipelineWorkspaceButler.get_init_output_refs`.
+   It is a major change here that these are written before a quantum graph is generated.
+   This has always made more sense, since init datasets do not depend on data IDs or other the criteria that go into quantum graph generation, but we defer init-output writes today to after quantum graph generation in order to defer the first central-repository write operations as along as possible (particularly until after we are past the possibility of errors in quantum graph generation).
+   With workspaces deferring committing any datasets to the central repository already, this is no longer a concern and we are free to move init-output writes earlier.
+
+2. Quanta are built for the active tasks or a subset thereof via one or more calls to :meth:`~PipelineWorkspaceButler.build_quanta`.
+   Quanta are persisted to the workspace in an implementation-defined way (the first implementation will use files similar to the ``.qgraph`` files we currently save externally).
+   In a sharded workspace, the quanta for different disjoint sets of shard data IDs (not arbitrary data IDs!) may be built separately - at first incrementally, by serial calls to :meth:`~PipelineWorkspaceButler.build_quanta`, but eventually concurrent calls or `multiprocessing` parallelism should be possible as well.
+   We also eventually expect to support building the quanta for subsequent tasks in separate (but serial) allowing different ``where`` expressions (etc) for different tasks within the same graph, though again this will may not be included at first.
+   This is actually a really big deal: it's a major step towards finally addressing the infamous :jira:`DM-21904` problem, which is what prevents us from building a correct quantum graph for a full DRP pipeline.
+   Very large scale productions (of the sort handled by Campaign Management) will continue to be split up into multiple workspaces/collections with external sharding, but smaller CI and developer-initiated runs of the full pipeline should possible within a single workspace, with a single batch submission and a single output :attr:`~lsst.daf.butler.CollectionType.RUN` collection.
+   :meth:`WorkspaceButler.transfer_inputs` does nothing on a :class:`PipelineWorkspaceButler` unless quanta have already been generated.
+
+3. Quanta are executed via one or more calls to :meth:`~PipelineWorkspaceButler.run_quanta`.
+   Here the base class does specify correct behavior in the presence of concurrent calls, *if* the quanta matching the arguments to those calls are disjoint: implementations must not attempt to execute a matching quantum until its upstream quanta have executed successfully, and block until this is the case.
+   Quanta that have already been run are automatically skipped, while those that fail continue to block everything downstream.
+   :meth:`~PipelineWorkspaceButler.run_quanta` accepts both simple UUIDs and rich expressions in its specification of which quanta to run, but only the former is guaranteed to be O(1) in the size of the graph; anything else could traversing the full graph, which is O(N).
+   Passing quantum UUIDs to :class:`PipelineWorkspaceButler` is what we expect BPS to do under the hood, so this has to be fast, while everything
+   else is a convenience.
+
+:class:`PipelineWorkspaceButler` has several methods for tracking these state transitions:
+
+- :attr:`~PipelineWorkspaceButler.active_tasks`: the set of currently active tasks;
+
+- :meth:`~PipelineWorkspaceButler.get_built_quanta_summary`: the set of task and shard data ID combinations for which quanta have already been built;
+
+- :meth:`~PipelineWorkspaceButler.query_quanta`: the execution status of all built quanta.
+  This method's signature is identical to that of :meth:`~Butler.query_provenance`, but it is limited to the workspace's own quanta.
+  Since it reports on quanta that could be executing concurrently, the base class makes very weak guarantees about how up-to-date its information may be.
+  It may also be far less efficient than WMS-based approaches to getting status, especially for queries where the entire quantum graph has to be traversed.
+  The ideal scenario (but probably not a near-term one) for BPS would be a WMS-specific workspace provided by a BPS plugin implementing this method to use WMS approaches first, delegating to :class:`PipelineWorkspaceButler` via composition or inheritance with narrower queries only when necessary.
+
+In development mode, task init-outputs (including configs) are rewritten on every call to :meth:`~PipelineWorkspaceButler.build_quanta` or :meth:`~PipelineWorkspaceButler.run_quanta`, because we have no way to check whether their contents would change when software versions and configs are not controlled.
+Quanta are not automatically rebuilt, because graph building is often slow, most development changes to tasks do not change graph structure, and it is reasonable to expect developers to be aware of when it does.
+We *can* efficiently most detect changes to the :class:`~lsst.pipe.base.pipeline_graph.PipelineGraph` due to code or config changes and warn or fail when the quantum graph is not rebuilt when it should be, but this is not rigorously true: changes to a :meth:`~lsst.pipe.base.PipelineTaskConnections.adjustQuantum` implementation are invisible unless the quantum graph is actually rebuilt.
+Rebuilding the quantum graph for a shard-task combination that already has quanta is permitted only in development mode, where it immediately deletes all outputs that may exist from executing the previous quanta for that combination.
+
+:class:`PipelineWorkspaceButler` also provides methods for changing the status of already-executed quanta, even outside development mode, with consistent changes to (including, sometimes, removal of) their output datasets:
+
+- :meth:`~PipelineWorkspaceButler.accept_failed_quanta` marks failed quanta as successful (while remembering their original failed state and error conditions), allowing downstream quanta to be run as long as they can do so without the outputs the failed quanta would have produced.
+  Invoking this on all failed quanta is broadly equivalent to committing all successfully-produced datasets to the central data repository and starting a new workspace with the committed :attr:`~lsst.daf.butler.CollectionType.RUN` collection as input, which is effectively how failures are accepted today.
+  It is worth considering whether we should require all failed quanta to be accepted before a workspace is committed (outside development mode) to make this explicit rather than implicit.
+- :meth:`~PipelineWorkspaceButler.poison_successful_quanta` marks successful quanta as failures, as might need to occur if QA on their outputs revealed a serious problem that did not result in an exception.
+  Downstream quanta that had already executed are also marked as failed - we assume bad inputs implies bad outputs.
+  This does not immediately remove output datasets, but it does mark them as :class:`INVALIDATED <DatasetStatus>`, preventing them from being committed unless they are again explicitly reclassified.
+- :meth:`~PipelineWorkspaceButler.reset_quanta` resets all matching quanta to the just-built :class:`PREDICTED <QuantumStatus>` state, deleting any existing outputs.
+
+The :meth:`~PipelineWorkspaceButler.activate_tasks` and :meth:`~PipelineWorkspaceButler.build_quanta` methods accept  a parsed string :class:`PipelineGraphExpression` similar to (but simpler than) the :class:`QuantumGraphExpression` described in :ref:`quantum-graph-and-provenance-queries`, which just uses dataset types and task labels as identifiers since data IDs and UUIDs are irrelevant.
+We also expect to enable this expression language to be used in the definition of labeled subsets in pipeline YAML files in the future.
+
+.. _cli:
+
+Command-line interface
+======================
+
+This technote does not yet include a prototype command-line interface for :class:`PipelineWorkspaceButler`, despite this being the main way we expect most users to interact with it.
+We do expect the CLI to involve a suite of new ``butler`` subcommands (possibly another level of nesting, i.e. ``butler workspace build-quanta``, ``butler workspace run-quanta``), and for the current ``pipetask`` tool to be deprecated in full rather than migrated.
+Details will be added to this technote on a future ticket.
+
+.. _implementation-notes:
+
+Implementation notes
+====================
+
+While the interface of :class:`PipelineWorkspaceButler` is intended to permit implementations that store their persistent state in other ways, such as a NoSQL database (Redis seems particularly well suited), the initial implementation will use files.
+We'll need a file-based implemenatation in the long term anyway to make it easy to set up a minimal middleware environment without the sort administrative responsibilities nearly all databases involve.
+
+These files will *sometimes* be managed by a :class:`~lsst.daf.butler.Datastore`; certainly this will be the case for the file artifacts of datasets that could be eventually committed as-is back to the central repository, including the existing workspace-written datasets like ``packages`` and the new ``pipeline`` and ``pipeline_graph`` datasets.
+
+Quantum graphs don't fit as well into :class:`~lsst.daf.butler.Datastore` management.
+This is partly a conceptual issue - we expect quantum graph files to continue to provide the sort of dataset metadata (data IDs, datastore records) the database provides for the central repository (as in today's QBB), so putting quantum graph files into a :class:`~lsst.daf.butler.Datastore` is a little like putting a SQLite database file into a :class:`~lsst.daf.butler.Datastore`.
+And this isn't entirely conceptual - like SQLite database files, we may want to be able to modify quantum graph files in-place (even if that's just to append), and that's not a door we want to open for the butler dataset concept.
+Quantum graph files also exist on the opposite end of the spectrum from regular pipeline output datasets in terms of whether we will want to rewrite them rather than just ingest them on commit.
+Even if provenance quantum graphs in the central repository are stored in files initially (the plan in mind here), we probably want to strip out all of the dimension record data they hold that is wholly redundant with what's in the database, and since concerns about modifying the graphs disappear after commit, we probably want to consolidate the graph information into fewer files.
+
+This last point also holds for a new category of file-based state we'll need to add for :class:`PipelineWorkspaceButler`: per-quantum status files that are written after each a quantum is executed.
+In addition to status flags and exception information for failures, these are can hold output-dataset datastore records, and their existence is what downstream quanta will block on in :class:`PipelineWorkspaceButler.run_quanta`.
+These will be scanned as-is by :class:`PipelineWorkspaceButler.query_quanta`, since that's all it can do, but we really want to merge this status information with the rest of the quantum graph on commit (while dropping the redundant dimension records, and moving datastore records into the central database), potentially making :class:`Butler.query_provenance` much more efficient in terms of storage and access cost.
 
 .. _prototype-code:
 
@@ -233,18 +337,6 @@ This occasionally includes proto-implementations, but only when these are partic
 
 daf_butler
 ----------
-
-.. py:class:: WorkspaceFactory
-
-   .. literalinclude:: daf_butler.py
-      :language: py
-      :pyobject: WorkspaceFactory
-
-.. py:class:: WorkspaceConfig
-
-   .. literalinclude:: daf_butler.py
-      :language: py
-      :pyobject: WorkspaceConfig
 
 .. py:class:: Butler
 
@@ -274,6 +366,18 @@ daf_butler
          :language: py
          :pyobject: ButlerConfig.make_workspace_butler
 
+.. py:class:: WorkspaceFactory
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: WorkspaceFactory
+
+.. py:class:: WorkspaceConfig
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: WorkspaceConfig
+
 .. py:class:: WorkspaceButler
 
    .. py:method:: make_external
@@ -300,17 +404,23 @@ daf_butler
          :language: py
          :pyobject: WorkspaceButler.commit
 
-.. py:class:: QuantumGraphExpression
+   .. py:method:: transfer_inputs
 
-   .. literalinclude:: daf_butler.py
-      :language: py
-      :pyobject: QuantumGraphExpression
+      .. literalinclude:: daf_butler.py
+         :language: py
+         :pyobject: WorkspaceButler.transfer_inputs
 
 .. py:class:: QuantumGraph
 
    .. literalinclude:: daf_butler.py
       :language: py
       :pyobject: QuantumGraph
+
+.. py:class:: QuantumGraphExpression
+
+   .. literalinclude:: daf_butler.py
+      :language: py
+      :pyobject: QuantumGraphExpression
 
 .. py:class:: QuantumStatus
 
@@ -329,6 +439,78 @@ pipe_base
 ---------
 
 .. py:class:: PipelineWorkspaceButler
+
+   .. py:attribute:: development_mode
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.development_mode
+
+   .. py:method:: get_pipeline_graph
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.get_pipeline_graph
+
+   .. py:method:: get_pipeline
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.get_pipeline
+
+   .. py:method:: reset_pipeline
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.reset_pipeline
+
+   .. py:method:: get_packages
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.get_packages
+
+   .. py:attribute:: active_tasks
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.active_tasks
+
+   .. py:method:: activate_tasks
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.activate_tasks
+
+   .. py:method:: get_init_input_refs
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.get_init_input_refs
+
+   .. py:method:: get_init_output_refs
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.get_init_output_refs
+
+   .. py:method:: build_quanta
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.build_quanta
+
+   .. py:method:: get_built_quanta_summary
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.get_built_quanta_summary
+
+   .. py:method:: query_quanta
+
+      .. literalinclude:: pipe_base.py
+         :language: py
+         :pyobject: PipelineWorkspaceButler.query_quanta
 
    .. py:method:: run_quanta
 
@@ -354,6 +536,11 @@ pipe_base
          :language: py
          :pyobject: PipelineWorkspaceButler.reset_quanta
 
+.. py:class:: PipelineGraphExpression
+
+   .. literalinclude:: pipe_base.py
+      :language: py
+      :pyobject: PipelineGraphExpression
 
 
 References

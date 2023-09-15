@@ -4,7 +4,7 @@ from abc import abstractmethod
 import uuid
 
 from types import EllipsisType
-from typing import Any, TypeAlias
+from typing import Any
 from collections.abc import Iterable, Mapping, Set
 from lsst.resources import ResourcePathExpression
 from lsst.pipe.base import Pipeline, PipelineGraph
@@ -32,45 +32,25 @@ class PipelineGraphExpression:
       ``collections.abc.Set[str]``.
     """
 
-PipelineGraphWildcard: TypeAlias = PipelineGraphExpression | str | Iterable[str] | EllipsisType
-
 
 class PipelineWorkspaceButler(WorkspaceButler):
-    """Workspace butler for basic pipeline execution.
-
-    This workspace butler assumes tasks are `PipelineTasks` and is capable of
-    running them in serial in the current process.
-
-    A trivial subclass in ``ctrl_mpexec`` could extend this to running them in
-    parallel with multiprocessing (yes, I'm proposing we gut ``ctrl_mpexec``
-    and move most of its functionality to ``pipe_base``).
-
-    I think it'd be cool if BPS could also use the `WorkspaceButler` interface,
-    or even inherit from `PipelineWorkspaceButler`, but I don't know how
-    feasible that actually is.  And we don't have to do that to make BPS work
-    with the workspace-butler system; it could just change what the
-    command-lines in BPS YAML files are.
-
-    Sharded workspaces of this type can build graphs and run quanta on each
-    ``(task, data ID)`` combination separately (as long as tasks are processed
-    in topological order for each data ID), in addition to being able to commit
-    each data ID independently.
-    """
+    """Workspace butler for basic pipeline execution."""
 
     @property
     @abstractmethod
     def development_mode(self) -> bool:
-        """Whether this workspace is in development mode, in which version and
-        configuration changes are permitted but provenance is limited.
-
-        This can always be set to enter development mode (`True`), but this
-        is irreversible.
-        """
+        # Docstring in setter below.
         raise NotImplementedError()
 
     @development_mode.setter
     @abstractmethod
     def development_mode(self, value: bool) -> None:
+        """Whether this workspace is in development mode, in which version and
+        configuration changes are permitted but provenance is limited.
+
+        This can be set to `True` to enter development mode at any time, but
+        doing so is irreversible.
+        """
         raise NotImplementedError()
 
     @abstractmethod
@@ -99,8 +79,7 @@ class PipelineWorkspaceButler(WorkspaceButler):
     ) -> None:
         """Update the pipeline associated with this workspace.
 
-        This is only permitted if the workspace in development mode or if no
-        tasks have been activated.
+        This is only permitted if the workspace in development mode.
 
         This operation requires read access to the central data repository
         database (to resolve dataset types).
@@ -127,7 +106,11 @@ class PipelineWorkspaceButler(WorkspaceButler):
         raise NotImplementedError()
 
     @abstractmethod
-    def activate_tasks(self, spec: PipelineGraphWildcard = ..., /, ) -> None:
+    def activate_tasks(
+        self,
+        spec: PipelineGraphExpression | str | Iterable[str] | EllipsisType = ...,
+        /,
+    ) -> None:
         """Activate tasks matching the given pattern.
 
         This writes init-outputs for the given tasks.  Activating a task whose
@@ -161,7 +144,7 @@ class PipelineWorkspaceButler(WorkspaceButler):
     def build_quanta(
         self,
         *,
-        tasks: PipelineGraphWildcard | None = None,
+        tasks: PipelineGraphExpression | str | Iterable[str] | EllipsisType | None = None,
         where: str = "",
         bind: Mapping[str, Any] | None = None,
         data_id: DataId | None = None,
@@ -220,33 +203,11 @@ class PipelineWorkspaceButler(WorkspaceButler):
         raise NotImplementedError()
 
     @abstractmethod
-    def query_quanta(
-        self,
-        *,
-        where: QuantumGraphExpression = ...,
-        bind: Mapping[str, Any] | None = None,
-        data_id: DataId | None = None,
-        **kwargs: Any,
-    ) -> QuantumGraph:
-        """Query for quanta that have already been built and possibly
-        executed.
-
-        The returned QuantumGraph is a snapshot of the workspace's state, not a
-        view.  If quanta are currently being executed when this is called, the
-        status for different quanta may not reflect the same instant in time,
-        but the states for a single quantum and its output datasets are always
-        consistent (but possibly already out-of-date by the time the method
-        returns).  It is an error to call this method while quanta are being
-        built, but workspaces are not required to guard against this.
-        """
-        raise NotImplementedError()
-
-    @abstractmethod
     def run_quanta(
         self,
         *,
         quanta: uuid.UUID | Iterable[uuid.UUID] | EllipsisType = ...,
-        where: QuantumGraphExpression = ...,
+        where: QuantumGraphExpression | str | EllipsisType = ...,
         bind: Mapping[str, Any] | None = None,
         data_id: DataId | None = None,
         **kwargs: Any,
@@ -258,11 +219,30 @@ class PipelineWorkspaceButler(WorkspaceButler):
         raise NotImplementedError()
 
     @abstractmethod
-    def get_run_quanta_summary(self) -> Set[tuple[str, DataCoordinate]]:
-        """Report the combinations of task labels and sharding data IDs for
-        which quantum graphs have already been run.
+    def query_quanta(
+        self,
+        *,
+        where: QuantumGraphExpression | str | EllipsisType = ...,
+        bind: Mapping[str, Any] | None = None,
+        data_id: DataId | None = None,
+        **kwargs: Any,
+    ) -> QuantumGraph:
+        """Query for quanta that have already been built and possibly
+        executed.
 
-        Empty data IDs are returned for workspaces with no sharding dimensions.
+        See `Butler.query_provenance` for parameter details.
+
+        Notes
+        -----
+        The returned QuantumGraph is a snapshot of the workspace's state, not a
+        view.  If quanta are currently being executed when this is called, the
+        status for different quanta may not reflect the same instant in time,
+        but the states for a single quantum and its output datasets are always
+        consistent (but possibly already out-of-date by the time the method
+        returns).
+
+        The base class does not specify the result when quanta are currently
+        built while this method is called, but derived classes may enable this.
         """
         raise NotImplementedError()
 
@@ -311,25 +291,7 @@ class PipelineWorkspaceButler(WorkspaceButler):
         data_id: DataId | None = None,
         **kwargs: Any,
     ) -> None:
-        raise NotImplementedError()
-
-    @abstractmethod
-    def transfer_inputs(self, transfer: str | None = "copy") -> None:
-        """Transfer file artifacts for all overall-input datasets to the
-        workspace root and update the URIs used to fetch them during execution
-        accordingly.
-
-        Notes
-        -----
-        This method can only be called if the workspace root is outside the
-        central data repository root.  After it has been called it should be
-        possible to relocate the workspace directory to a system disconnected
-        from the central data repository and still call `run_quanta` or
-        `export`.
-
-        This requires quanta to already exist, so calling it before building
-        the complete quantum graph is usually a mistake, but workspace
-        implementations are not required to guard against this.  It may be
-        called either before or after `run_quanta`.
+        """Change the status of matching quanta to `~QuantumStatus.PREDICTED`
+        and delete all existing outputs.
         """
         raise NotImplementedError()

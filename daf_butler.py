@@ -122,6 +122,12 @@ class DatasetStatus(enum.Flag):
 
     INVALIDATED = enum.auto()
     """Dataset has been produced but the producing task later failed.
+
+    This can also occur if this quantum or an upstream one was poisoned
+    (manually marked as failed after it had apparently succeeded).
+
+    Invalidated datasets are not transferred to the central data repository
+    on workspace commit, but they may be reclassified again prior to commit.
     """
 
 
@@ -522,6 +528,19 @@ class WorkspaceButler(LimitedButler):
         self.abandon()
         return full_butler
 
+    @abstractmethod
+    def transfer_inputs(self, transfer: str | None = "copy") -> None:
+        """Transfer file artifacts for all overall-input datasets to the
+        workspace root and update the URIs used to fetch them during execution
+        accordingly.
+
+        Notes
+        -----
+        This method can only be called if the workspace root is outside the
+        central data repository root.
+        """
+        raise NotImplementedError()
+
     @final
     def _get_parent_read_butler(self) -> Butler:
         """Return a read-only full butler for the central repository."""
@@ -858,15 +877,53 @@ class Butler:
 
     def query_provenance(
         self,
-        collections: Any,
+        collections: str | Sequence[str],
         *,
-        where: QuantumGraphExpression = ...,
+        where: QuantumGraphExpression | str | EllipsisType = ...,
         bind: Mapping[str, Any] | None = None,
         data_id: DataId | None = None,
         **kwargs: Any,
     ) -> QuantumGraph:
         """Query for provenance as a directed-acyclic graph of datasets and
         'quanta' that produce them.
+
+        Parameters
+        ----------
+        collections
+            Collection or collections to search, in order.  Overall-input
+            datasets may also be included, and shadowed quanta or datasets may
+            also appear if they are ancestors or descendants of a non-shadowed
+            quantum or dataset identified in the expression.
+        where : `QuantumGraphExpression`, `str`, or ``...``, optional
+            A `QuantumGraphExpression` that restricts the quanta to return, or
+            a string expression that can be parsed into one.  ``...`` can be
+            used to select all quanta consistent with criteria from other
+            arguments.
+        bind : `~collections.abc.Mapping`, optional
+            Mapping from identifiers appearing in ``where`` to the values they
+            should be substituted with.
+        data_id : `~collections.abc.Mapping` or \
+                `~lsst.daf.butler.DataCoordinate`, optional
+            Data ID that constrains the data IDs of all quanta returned and the
+            data IDs of any dataset data ID literalsappearin in ``where`` (e.g.
+            providing ``instrument`` so it doesn't have to be repeated every
+            time a ``visit`` is referenced).  Quanta with dimensions not
+            constrained by this data ID's dimensions are still constrained by
+            it via spatiotemporal relationships, just as they are in query
+            methods.
+        **kwargs
+            Additional keyword arguments are interpreted as data ID key-value
+            pairs, overriding and extending those in ``data_id``.
+
+        Returns
+        -------
+        quanta : `QuantumGraph`
+            Matching quanta and all of their inputs and outputs.  Note that
+            while datasets may be used in ``where`` to control which quanta are
+            returned via ancestors/descendant relationships, we never return a
+            quantum without including all of its inputs and outputs, and hence
+            arguments like ``data_id`` to not directly constrain the datasets
+            in the graph.
 
         Notes
         -----
@@ -878,8 +935,8 @@ class Butler:
         constraining ``where`` expression; provenance graph storage will
         probably be run-by-run rather than indexed by data ID or
         dataset/quantum UUID.  This means it may be much more efficient to
-        first query for datasets using data ID expressions in order to
-        extract their ``RUN`` collection names, before querying for their
-        provenance in a second pass.
+        first query for datasets using data ID expressions in order to extract
+        their ``RUN`` collection names, before querying for their provenance in
+        a second pass.
         """
         raise NotImplementedError()
