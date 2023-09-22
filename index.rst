@@ -352,7 +352,7 @@ daf_butler
 
       .. literalinclude:: daf_butler.py
          :language: py
-         :pyobject: Butler.make_workspace
+         :pyobject: Butler.get_workspace
 
    .. py:method:: query_provenance
 
