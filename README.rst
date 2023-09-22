@@ -14,7 +14,9 @@ Butler management of quantum graph storage and execution
 DMTN-271
 ========
 
-This technote proposes a new model for executing pipelines against butler repositories, in which quantum graphs are stored in the butler repository and the `pipetask` tool is ultimately replaced with a new command-line interface that uses a Quantum-backer for all execution.
+This technote proposes a new model for executing pipelines against butler repositories, in which both quantum graphs and output datasets are managed by a *butler workspace* before being committed back to the central data repository.
+Workspaces generalize the "quantum-backed butler" system (DMTN-177) to all butler-backed execution with a more powerful and use-case-focused interface than the current ``pipetask`` tool.
+By storing quantum graphs in a butler-managed location, workspaces also pave the way to storing quantum provenance in butler.
 
 **Links:**
 
