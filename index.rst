@@ -404,7 +404,7 @@ daf_butler
 
       .. literalinclude:: daf_butler.py
          :language: py
-         :pyobject: WorkspaceButler.commit
+         :pyobject: WorkspaceButler.export
 
    .. py:method:: transfer_inputs
 
