@@ -1,6 +1,12 @@
-:tocdepth: 1
+########################################################
+Butler management of quantum graph storage and execution
+########################################################
 
-.. sectnum::
+.. abstract::
+
+   This technote proposes a new model for executing pipelines against butler repositories, in which quantum graphs are stored in the butler repository and the `pipetask` tool is ultimately replaced with a new command-line interface that uses a Quantum-backer for all execution.
+
+
 
 .. Metadata such as the title, authors, and description are set in metadata.yaml
 
@@ -548,7 +554,8 @@ pipe_base
 References
 ==========
 
-.. rubric:: References
+References
+==========
 
-.. bibliography:: local.bib lsstbib/books.bib lsstbib/lsst.bib lsstbib/lsst-dm.bib lsstbib/refs.bib lsstbib/refs_ads.bib
-   :style: lsst_aa
+
+.. bibliography::
