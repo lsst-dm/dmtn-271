@@ -3,14 +3,16 @@
 .. image:: https://github.com/lsst-dm/dmtn-271/workflows/CI/badge.svg
    :target: https://github.com/lsst-dm/dmtn-271/actions/
 
-########################################################
-Butler management of quantum graph storage and execution
-########################################################
+######################################################################
+Reimagining quantum graphs for post-execution transfers and provenance
+######################################################################
 
 DMTN-271
 ========
 
-This technote proposes a new model for executing pipelines against butler repositories, in which quantum graphs are stored in the butler repository and the `pipetask` tool is ultimately replaced with a new command-line interface that uses a Quantum-backer for all execution.
+This technote proposes new approaches for ingesting pipeline execution outputs into butler repositories, with two distinct goals: storing input-output provenance in butler repositories (in both prompt processing and batch), and speeding up (and probably spreading out) the work of ingesting batch-processing outputs into the butler database.
+centered on new data structures for storing pre- and post-execution quantum graphs.
+These new approaches center around new in-memory and on-disk data structures for different quantum graphs in different stages of execution.
 
 **Links:**
 
