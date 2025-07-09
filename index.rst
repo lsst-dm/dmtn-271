@@ -412,8 +412,9 @@ For fault tolerance, this job would need to be configured to automatically retry
 A regular ``finalJob`` would also be included, with a dependency on the long-lived aggregation job as well as the regular jobs, but in the usual case it would only be responsible for constructing and ingesting the provenance graph from the aggregation graph.
 When a workflow is canceled (but ``finalJob`` is permitted to run), the ``finalJob`` would take over responsibility for aggregating the outputs of any quanta that did complete as well.
 
-The main disadvantage of this scheme is that using existence checks to poll for metadata and log datasets for quanta that may not have been completed results in more load on the storage system.
-This could be mitigated by increasing the fraction of the time the job spends sleeping, and possibly ensuring that these jobs go to a special queue that throttles their overall activity.
+The main disadvantage of this scheme is that using existence checks to poll for metadata and log datasets for completed results in more load on the storage system.
+WMS-specific tooling wrapped by BPS might be able to do this more efficiently.
+If not, it could still be mitigated by increasing the fraction of the time the job spends sleeping, and possibly ensuring that these jobs go to a special queue that throttles their overall activity.
 
 User-space Daemon
 -----------------
@@ -433,6 +434,45 @@ It would need to provide ways for users to cancel active workflows and determine
 
 The main downside of this approach is just that it is significantly more complex in code development and especially deployment than other options.
 Even if we go this route at USDF or other major data facilities, we should provide at least one alternative for smaller-scale BPS deployments.
+
+.. _future-extensions:
+
+Future Extensions
+=================
+
+High-level Provenance Queries
+-----------------------------
+
+This technote focuses on how to store provenance in the butler despite the fact that the core concepts of that provenance (the :class:`PipelineTask` ecosystem) are defined in packages downstream of butler: by ingesting butler datasets whose storage classes have parameters and components that provide enough flexibility to back a powerful and efficient provenance-query system.
+Designing that query system is an important part of the overall butler provenance framework, but is out of scope here.
+
+Additional Small-File Aggregation and Purging
+---------------------------------------------
+
+We propose including the small ``_metadata`` and ``_log`` datasets into the large per-run provenance files (instead of into separate ``zip`` files, as has been previously proposed) for a two reasons:
+
+- We need to at least existence-check (``_log``) and sometimes read (``_metadata``) these datasets in order to gather provenance.
+- As noted in :ref:`file-formats`, at the scale of millions of files, direct ``zip`` performance is not nearly as fast and space-efficient as our addressed multi-block storage.
+
+It may be useful in the future to zip together other output datasets at the aggregation stage, and this could also be a good time to delete intermediate datasets that we know we don't want to bring home.
+The aggregation system is in a good position to determine when it is safe to do either, and to do it efficiently, but it would need to build on top of a currently-nonexistent system for describing how different dataset types in a pipeline should be handled.
+
+Butler-Managed Quantum Graphs
+-----------------------------
+
+The fact that :class:`~lsst.daf.butler.QuantumBackedButler` writes to storage before we ingest the corresponding datasets into the butler database opens the door to orphaning those files with little or no record that they exist when failures occur.
+
+The new quantum graph variants described here could help with this: the aggregation tooling is designed to find exactly the datasets that might exist but haven't been ingested into the butler database yet.
+If we registered these graphs with the butler before we start executing them (i.e. stored them in butler-managed locations), files wouldn't ever really be fully orphaned; butler tooling could always go back and walk those graphs to ingest or delete those files later.
+
+Because the butler intentionally doesn't know anything about quantum graphs per se, this would require a new abstraction layer for this sort of "uningested dataset manifest" for which quantum graphs could serve as one implementation.
+
+Passing Extended Status via BPS
+-------------------------------
+
+The status-gathering described here depends only on middleware interfaces defined in ``pipe_base`` and ``ctrl_mpexec`` (just like ``pipetask report``), which provides a good baseline when nothing else about the execution system can be assumed.
+BPS generally knows at least a bit more, however (especially about failures), and some plugins may know considerably more (especially if implement per-job status reporting).
+In the future we should provide hooks for BPS plugins to feed additional status information to the aggregatoin tooling.
 
 References
 ==========
