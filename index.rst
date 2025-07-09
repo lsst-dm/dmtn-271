@@ -386,9 +386,53 @@ Provenance graphs are designed to be ingested into the butler as a single datast
 .. _invoking-aggregation:
 
 Invoking Aggregation
-=================================
+====================
 
-TODO
+Our goal thus far has been to design low-level tooling that would be usable in many different schemes for how and when it could be invoked, but it is also worth exploring how various schemes might work in a bit more detail.
+Because the aggregation graph data structure does not support concurrent updates, any particular batch workflow would have to stick to one scheme, but different workflows could use different schemes, depending on their needs and scale.
+Introducing a locking mechanism would also permit mixing different schemes within a single workflow.
+
+Dependent Workflow DAG Jobs
+---------------------------
+
+Instead of making all aggregation the responsibility of a single ``finalJob``, we could add multiple aggregation jobs throughout the workflow DAG.
+These jobs would have to be placed in the DAG in such a way that would ensure that they do not run in parallel with each other, and they'd need depend on regular jobs to space them out (e.g. we could have one aggregation job for each task).
+In this scheme each aggregation job would look only for the quanta it depends on in the workflow DAG, and then exit.
+A regular ``finalJob`` would also be included to take care of any aggregation not done by the previous jobs, as well as constructing and ingesting the final provenance graph.
+
+One disadvantage of this scheme is that each aggregation job would only get triggered if all of its upstream jobs actually succeeded; running a job regardless of upstream success or failure as in ``finalJob`` may or may not be possible for different WMSs, and it would at the very least require additional BPS work.
+An early failure could thus prevent all aggregation jobs from ever becoming unblocked, leaving too much work for ``finalJob``.
+While this would still be an improvement on the status quo (since quanta usually succeed), it would likely not fully solve the problem of slow ``finalJob`` performance.
+
+Dedicated Workflow DAG Job
+--------------------------
+
+Because we envision an aggregation tool that could be configured to alternatively sleep and poll for newly-completed quanta (via metadata and log existence checks, targeting only the unblocked quanta), we could delegate all aggregation work to a single workflow DAG job that is launched very early in the processing (e.g. after ``pipetaskInit``).
+For fault tolerance, this job would need to be configured to automatically retry indefinitely (unless explicitly killed with ``bps cancel``), and it would complete successfully only when all predicted quanta are aggregated (whether successful or not).
+A regular ``finalJob`` would also be included, with a dependency on the long-lived aggregation job as well as the regular jobs, but in the usual case it would only be responsible for constructing and ingesting the provenance graph from the aggregation graph.
+When a workflow is canceled (but ``finalJob`` is permitted to run), the ``finalJob`` would take over responsibility for aggregating the outputs of any quanta that did complete as well.
+
+The main disadvantage of this scheme is that using existence checks to poll for metadata and log datasets for quanta that may not have been completed results in more load on the storage system.
+This could be mitigated by increasing the fraction of the time the job spends sleeping, and possibly ensuring that these jobs go to a special queue that throttles their overall activity.
+
+User-space Daemon
+-----------------
+
+It is not uncommon for BPS users to run ``bps report`` repeatedly while their workflows are running.
+These users (the author included) would probably appreciate being able to just run the aggregation tool (in sleep/poll) mode themselves, since the tool would thus naturally be able to provide them with the status of both the execution and the ingestion of outputs into the butler (with latter slightly out-of-date).
+
+This scheme would be incompatible with having a ``finalJob`` that also runs aggregation, unless we introduce a locking mechanism, so it would rely on users remembering to actually run the tool and keeping it running over the course of a workflow.
+As with a dedicated DAG job, load from existence-check polling may also be a concern if the sleep fraction is not high enough, and in this case there would be no coordinated way to throttle multiple workflows from multiple users.
+
+Multi-workflow Aggregation Service
+----------------------------------
+
+To provide the most control over how database inserts are batched together and fully minimize existence checks, we could stand up a data-facility-wide service that receives messages (e.g. Kafka) from completed batch jobs to trigger aggregation.
+Such a service would need to be notified when a new submission is started, allowing it to set up a new aggregation graph for it, and it would append to that graph only when either a certain number of quanta completed or a certain amount of time had passed.
+It would need to provide ways for users to cancel active workflows and determine when a workflow's outputs had been fully aggregated and ingested into the butler.
+
+The main downside of this approach is just that it is significantly more complex in code development and especially deployment than other options.
+Even if we go this route at USDF or other major data facilities, we should provide at least one alternative for smaller-scale BPS deployments.
 
 References
 ==========
