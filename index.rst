@@ -479,9 +479,3 @@ Passing Extended Status via BPS
 The status-gathering described here depends only on middleware interfaces defined in ``pipe_base`` and ``ctrl_mpexec`` (just like ``pipetask report``), which provides a good baseline when nothing else about the execution system can be assumed.
 BPS generally knows at least a bit more, however (especially about failures), and some plugins may know considerably more (especially if we implement per-job status reporting).
 In the future we should provide hooks for BPS plugins to feed additional status information to the aggregation tooling.
-
-References
-==========
-
-
-.. bibliography::
