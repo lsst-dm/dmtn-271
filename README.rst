@@ -11,7 +11,6 @@ DMTN-271
 ========
 
 This technote proposes new approaches for ingesting pipeline execution outputs into butler repositories, with two distinct goals: storing input-output provenance in butler repositories (in both prompt processing and batch), and speeding up (and probably spreading out) the work of ingesting batch-processing outputs into the butler database.
-centered on new data structures for storing pre- and post-execution quantum graphs.
 These new approaches center around new in-memory and on-disk data structures for different quantum graphs in different stages of execution.
 
 **Links:**

@@ -5,7 +5,6 @@ Reimagining quantum graphs for post-execution transfers and provenance
 .. abstract::
 
    This technote proposes new approaches for ingesting pipeline execution outputs into butler repositories, with two distinct goals: storing input-output provenance in butler repositories (in both prompt processing and batch), and speeding up (and probably spreading out) the work of ingesting batch-processing outputs into the butler database.
-   centered on new data structures for storing pre- and post-execution quantum graphs.
    These new approaches center around new in-memory and on-disk data structures for different quantum graphs in different stages of execution.
 
 .. TODO: Delete the note below before merging new content to the main branch.
@@ -392,47 +391,54 @@ Our goal thus far has been to design low-level tooling that would be usable in m
 Because the aggregation graph data structure does not support concurrent updates, any particular batch workflow would have to stick to one scheme, but different workflows could use different schemes, depending on their needs and scale.
 Introducing a locking mechanism would also permit mixing different schemes within a single workflow.
 
-Dependent Workflow DAG Jobs
----------------------------
+Dependent DAG Jobs
+------------------
 
 Instead of making all aggregation the responsibility of a single ``finalJob``, we could add multiple aggregation jobs throughout the workflow DAG.
-These jobs would have to be placed in the DAG in such a way that would ensure that they do not run in parallel with each other, and they'd need depend on regular jobs to space them out (e.g. we could have one aggregation job for each task).
+These jobs would have to be placed in the DAG such that they do not run in parallel with each other, and they'd need depend on regular jobs to space them out temporally (e.g. we could have one aggregation job for each task).
 In this scheme each aggregation job would look only for the quanta it depends on in the workflow DAG, and then exit.
 A regular ``finalJob`` would also be included to take care of any aggregation not done by the previous jobs, as well as constructing and ingesting the final provenance graph.
 
-One disadvantage of this scheme is that each aggregation job would only get triggered if all of its upstream jobs actually succeeded; running a job regardless of upstream success or failure as in ``finalJob`` may or may not be possible for different WMSs, and it would at the very least require additional BPS work.
+A major disadvantage of this scheme is that each aggregation job would only get executed if all of its upstream jobs actually succeeded; running a job regardless of upstream success or failure as in ``finalJob`` may or may not be possible for different WMSs, and it would at the very least require additional BPS work.
 An early failure could thus prevent all aggregation jobs from ever becoming unblocked, leaving too much work for ``finalJob``.
-While this would still be an improvement on the status quo (since quanta usually succeed), it would likely not fully solve the problem of slow ``finalJob`` performance.
+While this would still be an improvement on the status quo (since quanta usually succeed, and failures also block outputs from being produced), it would likely not fully solve the problem of slow ``finalJob`` performance.
 
-Dedicated Workflow DAG Job
---------------------------
+Single Monitor Job
+------------------
 
 Because we envision an aggregation tool that could be configured to alternatively sleep and poll for newly-completed quanta (via metadata and log existence checks, targeting only the unblocked quanta), we could delegate all aggregation work to a single workflow DAG job that is launched very early in the processing (e.g. after ``pipetaskInit``).
 For fault tolerance, this job would need to be configured to automatically retry indefinitely (unless explicitly killed with ``bps cancel``), and it would complete successfully only when all predicted quanta are aggregated (whether successful or not).
-A regular ``finalJob`` would also be included, with a dependency on the long-lived aggregation job as well as the regular jobs, but in the usual case it would only be responsible for constructing and ingesting the provenance graph from the aggregation graph.
-When a workflow is canceled (but ``finalJob`` is permitted to run), the ``finalJob`` would take over responsibility for aggregating the outputs of any quanta that did complete as well.
+We would also need to find a way to ensure it is scheduled for execution early rather than late, since it would "tie" with essentially all regular jobs in any purely topological ordering of the DAG.
+
+A regular ``finalJob`` would also be included, with a dependency on the long-lived aggregation job as well as the regular jobs, but in the usual case it would only be responsible for constructing and ingesting the provenance graph from a fully-populated aggregation graph.
+When a workflow is canceled (but ``finalJob`` is permitted to run), the ``finalJob`` would take over responsibility for aggregating the outputs of any remaining quanta.
 
 The main disadvantage of this scheme is that using existence checks to poll for metadata and log datasets for completed results in more load on the storage system.
 WMS-specific tooling wrapped by BPS might be able to do this more efficiently.
-If not, it could still be mitigated by increasing the fraction of the time the job spends sleeping, and possibly ensuring that these jobs go to a special queue that throttles their overall activity.
+If not, load could still be mitigated by increasing the fraction of the time the job spends sleeping, and possibly ensuring that these jobs go to a special queue that throttles their overall activity (including overall database insert load).
+
+Assuming the special batch-scheduling behavior needed for this job is not difficult to implement in BPS, it probably provides the best balance between load-control and ease of implementation.
 
 User-space Daemon
 -----------------
 
 It is not uncommon for BPS users to run ``bps report`` repeatedly while their workflows are running.
-These users (the author included) would probably appreciate being able to just run the aggregation tool (in sleep/poll) mode themselves, since the tool would thus naturally be able to provide them with the status of both the execution and the ingestion of outputs into the butler (with latter slightly out-of-date).
+This suggests that users might appreciate being able to just run the aggregation tool (in sleep/poll) mode themselves, since the tool would thus naturally be able to provide them with the status of both the execution and the ingestion of outputs into the butler (with former slightly out-of-date).
+It is also much easier to diagnose problems in aggregation when they occur directly in a user's interactive shell rather than a batch worker.
 
 This scheme would be incompatible with having a ``finalJob`` that also runs aggregation, unless we introduce a locking mechanism, so it would rely on users remembering to actually run the tool and keeping it running over the course of a workflow.
 As with a dedicated DAG job, load from existence-check polling may also be a concern if the sleep fraction is not high enough, and in this case there would be no coordinated way to throttle multiple workflows from multiple users.
+
+Given these disadvantages, this would probably not be our preferred long-term approach for production jobs, but it would be extremely useful to have available for development and debugging.
 
 Multi-workflow Aggregation Service
 ----------------------------------
 
 To provide the most control over how database inserts are batched together and fully minimize existence checks, we could stand up a data-facility-wide service that receives messages (e.g. Kafka) from completed batch jobs to trigger aggregation.
-Such a service would need to be notified when a new submission is started, allowing it to set up a new aggregation graph for it, and it would append to that graph only when either a certain number of quanta completed or a certain amount of time had passed.
+Such a service would need to be notified when a new submission is started, allowing it to set up a new aggregation graph for it, and it would append to each graph only when either a certain number of quanta completed or a certain amount of time had passed.
 It would need to provide ways for users to cancel active workflows and determine when a workflow's outputs had been fully aggregated and ingested into the butler.
 
-The main downside of this approach is just that it is significantly more complex in code development and especially deployment than other options.
+The main downside of this approach is that it is significantly more complex in code development and especially deployment than other options.
 Even if we go this route at USDF or other major data facilities, we should provide at least one alternative for smaller-scale BPS deployments.
 
 .. _future-extensions:
@@ -449,9 +455,9 @@ Designing that query system is an important part of the overall butler provenanc
 Additional Small-File Aggregation and Purging
 ---------------------------------------------
 
-We propose including the small ``_metadata`` and ``_log`` datasets into the large per-run provenance files (instead of into separate ``zip`` files, as has been previously proposed) for a two reasons:
+We propose including the small ``_metadata`` and ``_log`` datasets into the large per-run provenance files (instead of into separate ``zip`` files, as has been previously proposed) for two reasons:
 
-- We need to at least existence-check (``_log``) and sometimes read (``_metadata``) these datasets in order to gather provenance.
+- We need to at least existence-check (``_log``) and maybe read (``_metadata``) these datasets in order to gather provenance, and we don't want to end up doing that twice;
 - As noted in :ref:`file-formats`, at the scale of millions of files, direct ``zip`` performance is not nearly as fast and space-efficient as our addressed multi-block storage.
 
 It may be useful in the future to zip together other output datasets at the aggregation stage, and this could also be a good time to delete intermediate datasets that we know we don't want to bring home.
@@ -471,8 +477,8 @@ Passing Extended Status via BPS
 -------------------------------
 
 The status-gathering described here depends only on middleware interfaces defined in ``pipe_base`` and ``ctrl_mpexec`` (just like ``pipetask report``), which provides a good baseline when nothing else about the execution system can be assumed.
-BPS generally knows at least a bit more, however (especially about failures), and some plugins may know considerably more (especially if implement per-job status reporting).
-In the future we should provide hooks for BPS plugins to feed additional status information to the aggregatoin tooling.
+BPS generally knows at least a bit more, however (especially about failures), and some plugins may know considerably more (especially if we implement per-job status reporting).
+In the future we should provide hooks for BPS plugins to feed additional status information to the aggregation tooling.
 
 References
 ==========
