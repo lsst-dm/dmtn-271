@@ -27,7 +27,7 @@ This is described in :ref:`provenance-graphs`.
 
 A key consideration here is that a pre-execution graph does not become a post-execution graph instantaneously; even if we ignore the actual time it takes to run the pipeline and consider a monolithic transfer as in today's BPS ``finalJob``, the process can take many hours and can easily be interrupted.
 And while the many detector-level prompt processing jobs are wholly independent, they are so numerous that for provenance storage we want to consider them pieces of much a single nightly (or multi-night) job that is updated incrementally.
-To address this, some of the new quantum graph data structures here are designed to be updated in-place on disk, via append-only writes\ [#append-as-chunks]_, to reflect completed or failed quanta and existence-checked dataset artifacts.
+To address this, some of the new quantum graph data structures here are designed to be updated in-place on disk, to reflect completed or failed quanta and existence-checked dataset artifacts.
 
 In batch, we envision something like the following process for generating and running a workflow:
 
@@ -44,10 +44,8 @@ In prompt processing, we expect small, per-detector predicted quantum graphs to 
 As part of this proposal, worker pods would also need to send a version of the predicted quantum graph to the service, either via Kafka (if it's small enough) or an S3 put.
 The ingestion service would then use that to append provenance to its own aggregation quantum graph file, rolling over to a new one and ingesting the old one only when the :attr:`~lsst.daf.butler.CollectionType.RUN` collection changes.
 
-Eventually, we will want direct ``pipetask`` executions to operate the same way as BPS (in this and many other ways), but with all steps all handled by a single Python command.
+Eventually, we will want direct ``pipetask`` executions to operate the same way as BPS (in this and many other ways), but with all steps handled by a single Python command.
 This may be rolled out well after the batch and prompt-processing variants are, especially if provenance-hostile developer use cases for clobbering and restarting with different versions and configuration prove difficult to reconcile with having a single post-execution graph dataset for each :attr:`~lsst.daf.butler.CollectionType.RUN` collection.
-
-.. [#append-as-chunks] In storage systems that do not support appending to files, we can simulate appends by writing numbered chunks to separate files, but for simplicity we will just refer to this as "appending" for the rest of this note.
 
 .. _current-status:
 
@@ -103,7 +101,7 @@ New File Formats
 Aside from a tiny binary prelude to the header, they are stored as blocks of LZMA-compressed JSON, with byte-offsets to per-quantum blocks stored in the header.
 Since the UUIDs we use to identify quanta and datasets in the public interface are large and random, they compress extremely poorly, and the current quantum graph format maps these to sequential integer IDs (only unique within a particular graph file) in order to save them only once.
 
-In the new quantum graph file formats proposed here, we will similarly rely on compressed JSON indexed by byte offsets, with some important changes.
+In most of the new quantum graph file formats proposed here, we will similarly rely on compressed JSON indexed by byte offsets, with some important changes.
 Instead of using a custom binary header and high-level file layout, we will use ``zip`` files to more easily aggregate multiple components (i.e. as "files" in a ``zip`` archive) that may be common to some graph variants but absent from others.
 Each JSON component will be represented by a Pydantic model, and we will use ZStandard\ [#zstd-in-zip]_ for compression.
 Pydantic representations of butler objects (e.g. :class:`~lsst.daf.butler.DatasetRef`) will be deliberately independent of the ones in ``daf_butler`` to avoid coupling the ``RemoteButler`` API model versions to the quantum graph serialization model version, except for types with schemas dependent on butler configuration (dimension and datastore records).
@@ -116,8 +114,12 @@ Each multi-block "file" is associated with a separate address "file" (i.e. in th
 Address files can be sorted by UUID, which yields a typical-case O(1) lookup performance (since UUIDs are more or less draw from a uniform random distribution), with even the worst-case only O(log N).
 As in the current quantum graph format, this will allow us to use these IDs instead of UUIDs in certain other components, making them compress much better.
 
-A typical quantum graph file will thus be a single ``zip`` file (or in the :ref:`aggregation quantum graph <aggregation-graphs>` case, a directory) containing several simple "single-block" compressed-JSON header files, one or two address files (for quanta and possibly datasets) and one or more multi-block files.
+A predicted or provenance quantum graph file will thus be a single ``zip`` file containing several simple "single-block" compressed-JSON header files, one or two address files (for quanta and possibly datasets) and one or more multi-block files.
 While we will not attempt to hide the fact that these are ``zip`` files and very much intend to leverage that fact for debugging, we will continue to use a custom filename extension and do not plan to support third-party readers.
+
+The update-in-place aggregation graphs will contain similar compressed-JSON components, but will combine them via blob columns in a SQLite database instead of ``zip`` archives and multi-block files.
+This will give us transactional writes, which will be important for fault tolerance, and enough efficient partial-read support to allow interrupted aggregation processes to resume quickly.
+By using the same compressed JSON components, the conversions between an aggregation graph and its predecessor and successor graphs should still be quite fast.
 
 .. [#zstd-in-zip] https://facebook.github.io/zstd/.
    In our benchmarks on real QG data, ZStandard yielded compression ratios and decompression times as good or better than LZMA, with orders-of-magnitude faster compression times.  While ``zip`` does not support ZStandard directly as one of its compression algorithms, it works just fine to explicitly compress and decompress when write and reading files in a ``zip`` archive.
@@ -214,90 +216,103 @@ It is likely the most efficient data structure for a wire graph will just be a s
 Aggregation Quantum Graphs
 --------------------------
 
-An "aggregation" graph is used to represent the provenance of a currently-executing graph, supporting append-only-writes to update quantum and dataset status.
-This graph is optimized for fast reads of its current progress and the overall graph structure, so a provenance-gathering process can quickly pick up where a previous one left off.
+An "aggregation" graph is used to represent the provenance of a currently-executing graph, supporting update-in-place writes to update quantum and dataset status.
+Unlike the other (read-only) graph variants, aggregation graphs are written to SQLite files in order to enable transactional writes and optimize certain partial reads that are needed to resume quickly after interruption.
 It is also designed to be transformed quickly into the final provenance graph.
 Unlike the quantum-only predicted graph, the aggregation graph data structure models a bipartite directed acyclic graph, in which quanta and datasets are different kinds of nodes and each edge connects a dataset to a quantum or a quantum to a dataset.
 
-Instead of a single ``zip`` archive, aggregation quantum graphs are stored as directories that can for the most part be "zipped up" to form the final read-only provenance graph.
-This lets us efficiently append to multiple files (or write new chunks for multiple conceptual files).
+The aggregation graph SQLite database will have the following tables:
+
+- ``header``: a single-column single-row compressed-JSON blob with the format version, collection metadata, and quantum and dataset counts.
+- ``bipartite_edges``: a single-column single-row compressed-JSON blob with an edge list for the dataset-quantum-dataset graph (using internal integer IDs).
+- ``quantum``: per-quantum provenance.  See :ref:`aggregation-quanta-table`
 Operations on aggregation graphs also require reading components of the predicted graph or wire graph they were constructed from.
+- ``dataset``: per-dataset provenance.  See :ref:`aggregation-dataset-table`.
 
-The on-disk components of an aggregation quantum graph are described in :ref:`aggregation-components`.
+Operations on aggregation graphs also require reading some components of the original predicted quantum graph.
 
-.. _aggregation-components:
+.. _aggregation-quanta-table:
 
-.. list-table:: Aggregation Quantum Graph Components
+.. list-table:: Aggregation Quantum Graph ``quanta`` schema
    :header-rows: 1
 
    * - Name
      - Type
      - Description
-   * - ``header``
-     - single-block
-     - Format version, collection metadata, quantum and dataset counts.
-   * - ``bipartite_edges``
-     - single-block
-     - Edge list for a dataset-quantum-dataset graph  (using internal integer IDs).
-   * - ``quanta``
-     - multi-block
-     - | UUIDs, task labels, data IDs, status, and exception information for
-       | each quantum; log and metadata dataset UUIDs and addresses (into
-       | the ``logs`` and ``metadata`` components).
-   * - ``datasets``
-     - multi-block
-     - | UUIDs, dataset type names, data IDs, and existence status for each
-       | each dataset (except log and metadata datasets).
-   * - ``logs``
-     - multi-block
-     - The content of all butler log datasets (one dataset per block).
-   * - ``metadata``
-     - multi-block
-     - The content of all butler metadata datasets (one dataset per block).
-   * - ``quantum_addresses``
-     - address (arbitrary order)
-     - | UUID to integer ID mapping for all quanta; byte offsets and sizes
-       | for the ``quanta``, ``logs``, and ``metadata`` components.
-   * - ``dataset_addresses``
-     - address (arbitrary order)
-     - | UUID to integer ID mapping for all datasets; byte offsets and sizes
-       | for the ``datasets`` component.
+   * - quantum_index
+     - INTEGER PRIMARY KEY
+     - Internal integer ID.
+   * - quantum_uuid
+     - UUID
+     - External UUID.
+   * - succeeded
+     - BOOLEAN
+     - Whether this quantum succeeeded.
+   * - provenance
+     - BLOB
+     - Task labels, data IDs, status, and exception information for each quantum.
+   * - log_index
+     - INTEGER
+     - Internal integer ID for the associated log dataset.
+   * - log_data
+     - BLOB
+     - Actual content of the log dataset.
+   * - metadata_index
+     - INTEGER
+     - Internal integer ID for the associated metadata dataset.
+   * - metadata_data
+     - BLOB
+     - Actual content of the log dataset.
 
-When the aggregation graph is first constructed, the ``header`` and ``bipartite_edges`` components are constructed in full from the information in the predicted or wire graph immediately.
-The other components are appended to as quanta are aggregated:
+.. _aggregation-dataset-table:
 
-1. When a set of quanta is recognized as having finished (successfully or unsuccessfully), either by receipt of a message or by scanning for the metadata and log datasets of unblocked quanta, their predicted-quantum information is loaded from the original predicted or wire graph.
-2. When metadata datasets exist (i.e. the quantum was successful), they are read in full to retrieve status information and dataset provenance.  For quanta that failed (the log exists but metadata does not, or a flag from the user indicates that all unsuccessful quanta should now be considered failures), the existence of all predicted output datasets is checked.
-3. Information about output datasets (including those that were predicted but not produced, but not including metadata and logs) is appended to the ``datasets`` multi-block file.
-4. The metadata datasets are reconverted to JSON, compressed, and appended to the ``metadata`` multi-block file.
-5. The log datasets are loaded, rewritten to JSON, compressed, and appended to the ``log`` multi-block file.
-6. If any quantum's metadata and log datasets are not inputs to any downstream quantum, they are deleted from their original location.  Similarly, if any of these quantum are the last consumers of an upstream metadata or log dataset, those upstream datasets are deleted from their original locations.
-7. Status and other per-quantum provenance is appended to the ``quanta`` multi-block file.
-8. Existing output datasets (not including metadata and logs) are ingested into the butler database.
-9. Addresses into the ``datasets`` multi-block file are appended to the ``dataset_addresses`` file.
-10. Addresses into the ``quanta``, ``metadata``, and ``logs`` multi-block files are appended to the ``quantum_addresses`` file.
+.. list-table:: Aggregation Quantum Graph ``dataset`` schema
+   :header-rows: 1
 
-Most of the above steps can happen on many quanta in parallel (scanning, dataset reads, generating and compressing JSON), with a sequence point at the end to perform all file append, delete, and database insert operations in bulk from a single process/thread.
-A working prototype developed for this technote uses :class:`concurrent.futures.ProcessPoolExecutor` and :mod:`asyncio` for this.
-The group size could be throttled by a timer and/or dataset/quantum count minimums.
+   * - Name
+     - Type
+     - Description
+   * - dataset_index
+     - INTEGER PRIMARY KEY
+     - Internal integer ID.
+   * - dataset_uuid
+     - UUID
+     - External UUID.
+   * - provenance
+     - BLOB
+     - Dataset type names, data IDs, and existence status for each dataset.
 
-When the aggregation tool is initialized from a stored aggregation graph, it performs the following steps:
+When the aggregation graph is first constructed, the ``header`` and ``bipartite_edges`` tables are constructed in full from the information in the predicted or wire graph immediately.
+The other tables are appended to as quanta are aggregated.
+The aggregation tool can be run in two different modes:
 
-1. It reads the ``bipartite_edges`` component and constructs a lightweight in-memory bipartite DAG for the complete predicted graph.
-2. It reads the ``quantum_addresses`` and ``dataset_addresses`` files in full.
-3. It checks that each multi-block file has the size predicted by the corresponding address file (or, alternately, that the last block in each file is at the right location, and records the right size internally).
-   An inconsistency indicates a previous interruption that must be reconciled by reading any blocks from multi-block files that are not referenced by their address files in order to recover those addresses.
-   Certain failures may require these orphaned metadata blocks to be decompressed and parsed as well, in order to reconstruct the information that is to be stored in other files.
-4. It checks that the ``dataset_addresses`` file has all output datasets predicted for the last quantum in the ``quantum_addresses`` file.
-   An inconsistency here also indicates a previous interruption that must be reconciled.
-5. If an interruption occurred, any existing output datasets that may or may not have been inserted into the database are flagged as needing special ``ON CONFLICT IGNORE`` handling on ingestion (which we would otherwise like to avoid in order to reduce locking).
-6. The in-memory DAG is traversed to find the last-aggregated quanta and identify those that may be ready for aggregation soon.
+- In "monitor" mode, the tool only processes successfully-completed quanta, as indicated by the existence of the ``metadata`` dataset.
+  This allows failures to be recovered by retries and restarts without invalidating any aggregation work already completed.
 
-Note that it is not necessary to read any of the multi-block files in full to restart processing, though it may be necessary to read the last chunk when the last attempt was interrupted.
-It is necessary to avoid races when appending to the aggregation graph, either by limiting how the aggregation tool is invoked for a particular run (see :ref:`invoking-aggregation`) or utilizing some kind of locking.
+- In "finalize" mode, the tool processes both successful and failed quanta, and when all quanta have been processed, it transforms the aggregation graph into a :ref:`provenance quantum graph <provenance-graphs>` and ingests it into the butler.
 
-The same size-consistency check information used to detect failures can similarly be used to allow multiple concurrent readers of an aggregation graph, even if writes are ongoing.
+The tool will run in parallel using Python ``multiprocessing``, with a single process responsible for writing to the SQLite aggregation graph file and the central butler database.
+This process will batch the writes for many quanta into a single transaction based on a timer and/or quantum/dataset counts.
+Other worker processes will be responsible for scanning for and reading ``metadata`` and ``log`` files, extracting information from them into provenance Pydantic models, and transforming that into compressed JSON to send to the writer process.
+In detail:
+
+1. When a quantum is recognized as having finished (successfully or unsuccessfully), either by receipt of a message or by scanning for the metadata and log datasets of unblocked quanta, its predicted-quantum information is loaded from the original predicted or wire graph.
+2. When metadata datasets exist (i.e. the quantum was successful), they are read in full to retrieve status information and dataset provenance.
+   For quanta that failed (the log exists but metadata does not, or a flag from the user indicates that all unsuccessful quanta should now be considered failures), the existence of all predicted output datasets is checked.
+3. Information about output datasets (including those that were predicted but not produced), is appended to the ``dataset`` table.
+4. Information about the quantum (including the full content of the log and metadata files) is appended to the ``quantum`` table.
+5. If the quantum's metadata and log datasets are not inputs to any downstream quantum, they are deleted from their original location.
+   Similarly, if this quantum is the last consumers of an upstream metadata or log dataset, those upstream datasets are deleted from their original locations.
+
+When the aggregation tool is initialized from a stored aggregation graph, it performs the following steps it reads the ``header`` and ``bipartite_edges`` components in full and constructs a lightweight in-memory bipartite DAG for the complete predicted graph.
+It then queries the quantum table for the IDs of the quantum that have already been aggregation and annotates the graph accordingly, allowing a graph traversal to identify unblocked quanta that should be monitored for completion.
+
+Note that it is not necessary to read any of the BLOB files in full to restart processing.
+While SQLite can in principle handle concurrent writes from multiple processes, it does not do so efficiently, and it is better to avoid races when appending to the aggregation graph by limiting how the aggregation tool is invoked for a particular run (see :ref:`invoking-aggregation`).
+It may be possible to configure SQLite to support parallel reads from other processes without significantly slowing down the writer process.
 If aggregation is invoked frequently enough, this could provide an efficient way for users or services to get (slightly old) status information about an ongoing run.
+
+Because SQLite only works on POSIX filesystems, in contexts where the only such available filesystem is temporary storage, the aggregation graph would have to be written to a permanent object-store location periodically to avoid having to start over from the beginning after being interrupted.
 
 .. _provenance-graphs:
 
@@ -305,8 +320,8 @@ Provenance Quantum Graphs
 --------------------------
 A provenance graph is used to store the input-output relationships and quantum status information for a full :attr:`~lsst.daf.butler.CollectionType.RUN` that is no longer being updated, either because it is complete or because it was abandoned.
 
-Provenance graphs are constructed by extracting components from both the original predicted or wire graph zip file and an aggregation graph directory and zipping them together.
-These components are copied without any changes, with the exception of the  ``dataset_addresses`` and ``quantum_addresses`` files from the aggregation graph, which must first be rewritten to be sorted by UUID to enable fast lookups by UUID in the future.
+Provenance graphs are constructed by extracting components from both the original predicted or wire graph zip file and an aggregation graph SQLite file and zipping them together.
+These components are copied without any changes, with the exception of the  ``dataset_addresses`` and ``quantum_addresses`` files from the aggregation graph, which must first be generated from the columns in the aggregation graph tables.
 
 The on-disk components of provenance quantum graph are described in :ref:`provenance-components`.
 
@@ -398,6 +413,7 @@ Instead of making all aggregation the responsibility of a single ``finalJob``, w
 These jobs would have to be placed in the DAG such that they do not run in parallel with each other, and they'd need depend on regular jobs to space them out temporally (e.g. we could have one aggregation job for each task).
 In this scheme each aggregation job would look only for the quanta it depends on in the workflow DAG, and then exit.
 A regular ``finalJob`` would also be included to take care of any aggregation not done by the previous jobs, as well as constructing and ingesting the final provenance graph.
+Most aggregation jobs would run in "monitor" mode, and the ``finalJob`` would run in "finalize" mode.
 
 A major disadvantage of this scheme is that each aggregation job would only get executed if all of its upstream jobs actually succeeded; running a job regardless of upstream success or failure as in ``finalJob`` may or may not be possible for different WMSs, and it would at the very least require additional BPS work.
 An early failure could thus prevent all aggregation jobs from ever becoming unblocked, leaving too much work for ``finalJob``.
@@ -411,7 +427,6 @@ For fault tolerance, this job would need to be configured to automatically retry
 We would also need to find a way to ensure it is scheduled for execution early rather than late, since it would "tie" with essentially all regular jobs in any purely topological ordering of the DAG.
 
 A regular ``finalJob`` would also be included, with a dependency on the long-lived aggregation job as well as the regular jobs, but in the usual case it would only be responsible for constructing and ingesting the provenance graph from a fully-populated aggregation graph.
-When a workflow is canceled (but ``finalJob`` is permitted to run), the ``finalJob`` would take over responsibility for aggregating the outputs of any remaining quanta.
 
 The main disadvantage of this scheme is that using existence checks to poll for metadata and log datasets for completed results in more load on the storage system.
 WMS-specific tooling wrapped by BPS might be able to do this more efficiently.
@@ -426,7 +441,7 @@ It is not uncommon for BPS users to run ``bps report`` repeatedly while their wo
 This suggests that users might appreciate being able to just run the aggregation tool (in sleep/poll) mode themselves, since the tool would thus naturally be able to provide them with the status of both the execution and the ingestion of outputs into the butler (with former slightly out-of-date).
 It is also much easier to diagnose problems in aggregation when they occur directly in a user's interactive shell rather than a batch worker.
 
-This scheme would be incompatible with having a ``finalJob`` that also runs aggregation, unless we introduce a locking mechanism, so it would rely on users remembering to actually run the tool and keeping it running over the course of a workflow.
+This scheme would be incompatible with having a ``finalJob`` that also runs aggregation (since we don't want parallel writes to the SQLite aggregation graph file), so it would rely on users remembering to actually run the tool and keeping it running over the course of a workflow.
 As with a dedicated DAG job, load from existence-check polling may also be a concern if the sleep fraction is not high enough, and in this case there would be no coordinated way to throttle multiple workflows from multiple users.
 
 Given these disadvantages, this would probably not be our preferred long-term approach for production jobs, but it would be extremely useful to have available for development and debugging.
@@ -440,6 +455,26 @@ It would need to provide ways for users to cancel active workflows and determine
 
 The main downside of this approach is that it is significantly more complex in code development and especially deployment than other options.
 Even if we go this route at USDF or other major data facilities, we should provide at least one alternative for smaller-scale BPS deployments.
+
+Handling Workflow Cancels and Restarts
+======================================
+
+In any of the above schemes, at least some of the quanta and output datasets produced by a workflow are likely to have already been aggregated (and ingested into the central butler database) when a workflow is canceled.
+
+For invocation schemes that involve a ``finalJob`` that runs aggregation, we have three choices for what cancelation should do, with different implications for how a subsequent restart might work:
+
+- If we do not run ``finalJob`` at all, the run is left partially-aggregated, with a SQLite aggregation graph still present that can be used to efficiently continue aggregation in a restart or by direct user invocation of the aggregation tool.
+  This increases the likelihood of leaving output datasets "orphaned" in storage with no records in the butler database (unless we implement :ref:`butler-managed-qgs`), if aggregation is never finalized.
+  Workflow restarts using the same predicted graph and in-progress aggregation graph would require no special handling in this mode.
+
+- If we run ``finalJob`` in "monitor" mode, the datasets produced by successful quanta will not be orphaned, but those produced by failures (mostly logs) could be, if aggregation is not finalized later.
+  Once again workflows restarts would not require any special handling.
+  Note that switching to "monitor" mode on cancelation would require some way of passing the canceling user's intent to the ``finalJob``, which may not be possible (or desirable if it is too messy).
+
+- If we run ``finalJob`` in "finalize" mode to completion, no datasets can be orphaned, but restarts get more difficult: we would need to remove the provenance graph from the butler repository and transform it back into an aggregation graph (this should be fairly efficient; all of the necessary information is present in roughly the right form).
+  This transformation would have to drop the provenance entries for all failures, since the restart implies that at least some of them may become successes.
+  Log and metadata datasets that are needed as inputs to failed quanta would also have to be restored to their original single-file locations.
+  While we do not do this today, it would also probably be appropriate to delete all outputs of failed quanta from at least the butler database at this time, to reduce reliance on clobbering mechanics and avoid the appearance of any butler-managed dataset being updated in place.
 
 .. _future-extensions:
 
@@ -462,6 +497,8 @@ We propose including the small ``_metadata`` and ``_log`` datasets into the larg
 
 It may be useful in the future to zip together other output datasets at the aggregation stage, and this could also be a good time to delete intermediate datasets that we know we don't want to bring home.
 The aggregation system is in a good position to determine when it is safe to do either, and to do it efficiently, but it would need to build on top of a currently-nonexistent system for describing how different dataset types in a pipeline should be handled.
+
+.. _butler-managed-qgs:
 
 Butler-Managed Quantum Graphs
 -----------------------------
