@@ -47,6 +47,18 @@ The ingestion service would then use that to append provenance to its own aggreg
 Eventually, we will want direct ``pipetask`` executions to operate the same way as BPS (in this and many other ways), but with all steps handled by a single Python command.
 This may be rolled out well after the batch and prompt-processing variants are, especially if provenance-hostile developer use cases for clobbering and restarting with different versions and configuration prove difficult to reconcile with having a single post-execution graph dataset for each :attr:`~lsst.daf.butler.CollectionType.RUN` collection.
 
+This technote partially supersedes :cite:`DMTN-205`, which assumes input-output graph provenance would be stored in butler database tables rather than files, but otherwise discusses provenance requirements and queries more completely.
+We now prefer the file approach for three reasons:
+
+- It is simpler to implement.
+- Provenance changes are much easier.
+- It provides a better separation of concerns between ``daf_butler`` and ``pipe_base``.
+
+This change does not affect our ability to support provenance queries (and in particular, we can continue to support the full IVOA provenance model).
+But it may limit our ability to use external tooling to *query* the IVOA provenance representation (e.g. of those tools expect a SQL database with a schema that hews closely to that representation).
+It may also add some overheads (involving shallow reads of files that correspond to a full :attr:`~lsst.daf.butler.CollectionType.RUN` collection) to some operations.
+But we expect this to be a worst-case slowdown (and a small one); we have no reason to believe that file-based provenance would be slower in general.
+
 .. _current-status:
 
 Current Status
@@ -226,7 +238,6 @@ The aggregation graph SQLite database will have the following tables:
 - ``header``: a single-column single-row compressed-JSON blob with the format version, collection metadata, and quantum and dataset counts.
 - ``bipartite_edges``: a single-column single-row compressed-JSON blob with an edge list for the dataset-quantum-dataset graph (using internal integer IDs).
 - ``quantum``: per-quantum provenance.  See :ref:`aggregation-quanta-table`
-Operations on aggregation graphs also require reading components of the predicted graph or wire graph they were constructed from.
 - ``dataset``: per-dataset provenance.  See :ref:`aggregation-dataset-table`.
 
 Operations on aggregation graphs also require reading some components of the original predicted quantum graph.
@@ -487,6 +498,18 @@ High-level Provenance Queries
 This technote focuses on how to store provenance in the butler despite the fact that the core concepts of that provenance (the :class:`PipelineTask` ecosystem) are defined in packages downstream of butler: by ingesting butler datasets whose storage classes have parameters and components that provide enough flexibility to back a powerful and efficient provenance-query system.
 Designing that query system is an important part of the overall butler provenance framework, but is out of scope here.
 
+A few cases are worth calling attention to:
+
+- By including all predicted datasets in the provenance files along with their existence status *at the time of execution*, we make it possible to whether a dataset was or was not not available as an input to a downstream task, regardless of whether it was ultimately retained.
+
+- Full-but-shallow reads of the bipartite graph will make it easy to support finding the set of indirect input datasets of a particular type that contributed to a particular output dataset (e.g. the ``raw`` datasets that went into a ``coadd``).
+  These sorts of questions need to be posed with care for which edges to traverse, however; e.g. *all* ``raw`` datasets in a DR contribute to the global photometric calibration, so naively they all contribute to any coadd dataset anywhere on the sky, at least as far as the full DAG is concerned.
+
+- A predicted quantum graph can be built for exactly reconstructing any existing dataset, provided we can determine the :attr:`~lsst.daf.butler.CollectionType.RUN` collection it was originally built in.
+  We can find that given the UUID for any dataset we have retained (by querying the butler database), and we can find it via provenance queries on other retained datasets.
+  But we do not have a good way to find the :attr:`~lsst.daf.butler.CollectionType.RUN` collection from the UUID of a non-retained dataset.
+  Given that the only way we expect users to obtain UUIDs of non-retained datasets is by inspecting the provenance of a retained one (either via provenance queries or file metadata), we do not expect this to be a problem.
+
 Additional Small-File Aggregation and Purging
 ---------------------------------------------
 
@@ -516,3 +539,8 @@ Passing Extended Status via BPS
 The status-gathering described here depends only on middleware interfaces defined in ``pipe_base`` and ``ctrl_mpexec`` (just like ``pipetask report``), which provides a good baseline when nothing else about the execution system can be assumed.
 BPS generally knows at least a bit more, however (especially about failures), and some plugins may know considerably more (especially if we implement per-job status reporting).
 In the future we should provide hooks for BPS plugins to feed additional status information to the aggregation tooling.
+
+References
+==========
+
+.. bibliography::
