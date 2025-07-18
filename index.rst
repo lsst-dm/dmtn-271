@@ -169,8 +169,9 @@ The on-disk components of a predicted quantum graph are described in :ref:`predi
      - Format version, collection metadata, quantum and dataset counts.
    * - ``pipeline_graph``
      - single-block
-     - | Serialized :class:`~pipeline_graph.PipelineGraph`, including
-       | all configuration.
+     - | Serialized :class:`~pipeline_graph.PipelineGraph`, including all
+       | configuration.  Lazy-loads config classes and other import-dependent
+       | types, allowing them to be inspected even after code changes.
    * - ``quantum_edges``
      - single-block
      - Edge list for a quantum-quantum DAG (using internal integer IDs).
@@ -273,7 +274,7 @@ Operations on aggregation graphs also require reading some components of the ori
      - Internal integer ID for the associated metadata dataset.
    * - metadata_data
      - BLOB
-     - Actual content of the log dataset.
+     - Actual content of the metadata dataset.
 
 .. _aggregation-dataset-table:
 
@@ -349,8 +350,9 @@ The on-disk components of provenance quantum graph are described in :ref:`proven
      - Format version, collection metadata, quantum and dataset counts.
    * - ``pipeline_graph``
      - single-block
-     - | Serialized :class:`~pipeline_graph.PipelineGraph`, including
-       | all configuration.
+     - | Serialized :class:`~pipeline_graph.PipelineGraph`, including all
+       | configuration.  Lazy-loads config classes and other import-dependent
+       | types, allowing them to be inspected even after code changes.
    * - ``bipartite_edges``
      - single-block
      - Edge list for a dataset-quantum-dataset graph.
