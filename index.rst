@@ -240,6 +240,9 @@ The aggregation graph SQLite database will have the following tables:
 - ``bipartite_edges``: a single-column single-row compressed-JSON blob with an edge list for the dataset-quantum-dataset graph (using internal integer IDs).
 - ``quantum``: per-quantum provenance.  See :ref:`aggregation-quanta-table`
 - ``dataset``: per-dataset provenance.  See :ref:`aggregation-dataset-table`.
+- ``to_ingest``: the internal integer IDs of datasets that are present in the ``datasets`` table but not yet ingested into the central butler database.
+- ``to_delete_logs``: the internal integer quantum IDs whose logs should be deleted but have not yet been.
+- ``to_delete_metadata``: the internal integer quantum IDs whose logs should be deleted but have not yet been.
 
 Operations on aggregation graphs also require reading some components of the original predicted quantum graph.
 
@@ -306,15 +309,24 @@ The aggregation tool can be run in two different modes:
 The tool will run in parallel using Python ``multiprocessing``, with a single process responsible for writing to the SQLite aggregation graph file and the central butler database.
 This process will batch the writes for many quanta into a single transaction based on a timer and/or quantum/dataset counts.
 Other worker processes will be responsible for scanning for and reading ``metadata`` and ``log`` files, extracting information from them into provenance Pydantic models, and transforming that into compressed JSON to send to the writer process.
-In detail:
+In detail, within one transaction:
 
 1. When a quantum is recognized as having finished (successfully or unsuccessfully), either by receipt of a message or by scanning for the metadata and log datasets of unblocked quanta, its predicted-quantum information is loaded from the original predicted or wire graph.
 2. When metadata datasets exist (i.e. the quantum was successful), they are read in full to retrieve status information and dataset provenance.
    For quanta that failed (the log exists but metadata does not, or a flag from the user indicates that all unsuccessful quanta should now be considered failures), the existence of all predicted output datasets is checked.
 3. Information about output datasets (including those that were predicted but not produced), is appended to the ``dataset`` table.
-4. Information about the quantum (including the full content of the log and metadata files) is appended to the ``quantum`` table.
-5. If the quantum's metadata and log datasets are not inputs to any downstream quantum, they are deleted from their original location.
-   Similarly, if this quantum is the last consumers of an upstream metadata or log dataset, those upstream datasets are deleted from their original locations.
+4. The IDs of datasets that were actually produced are added to the ``to_ingest`` table.
+5. Information about the quantum (including the full content of the log and metadata files) is appended to the ``quantum`` table.
+6. If the quantum's metadata and log datasets are not inputs to any downstream quantum, they are scheduled for deletion from their original location by inserting their IDs into the ``to_delete_logs`` and ``to_delete_metadata`` tables.
+   Similarly, if this quantum is the last consumers of an upstream metadata or log dataset, those upstream datasets are also scheduled for deletion.
+
+On a possibly different cadences, the tool also:
+
+1. Inserts all ``to_ingest`` datasets into the central butler database (without a SQLite transaction open, but with ``ON CONFLICT IGNORE`` to silently skip datasets that may have been ingested already), and then clears that table.
+2. Optionally copies the SQLite file to a permanent location as a checkpoint, if it is currently in a temporary one (e.g. in environments where only permanent object storage is available, and per-job scratch has to be used for SQLite).
+3. Actually deletes all metadata and log metadata files that are scheduled for deletion, and then clears that table.
+   If and only if permanent storage checkpoints are needed, this should only happen just after a checkpoint has been created and block any new logs or metadata from being scheduled for deletion (via a SQLite transaction) until it is done.
+   This ensures that we always have a copy of any log and metadata content either in the checkpoint location or in their original locations.
 
 When the aggregation tool is initialized from a stored aggregation graph, it performs the following steps it reads the ``header`` and ``bipartite_edges`` components in full and constructs a lightweight in-memory bipartite DAG for the complete predicted graph.
 It then queries the quantum table for the IDs of the quantum that have already been aggregation and annotates the graph accordingly, allowing a graph traversal to identify unblocked quanta that should be monitored for completion.
@@ -323,8 +335,6 @@ Note that it is not necessary to read any of the BLOB files in full to restart p
 While SQLite can in principle handle concurrent writes from multiple processes, it does not do so efficiently, and it is better to avoid races when appending to the aggregation graph by limiting how the aggregation tool is invoked for a particular run (see :ref:`invoking-aggregation`).
 It may be possible to configure SQLite to support parallel reads from other processes without significantly slowing down the writer process.
 If aggregation is invoked frequently enough, this could provide an efficient way for users or services to get (slightly old) status information about an ongoing run.
-
-Because SQLite only works on POSIX filesystems, in contexts where the only such available filesystem is temporary storage, the aggregation graph would have to be written to a permanent object-store location periodically to avoid having to start over from the beginning after being interrupted.
 
 .. _provenance-graphs:
 
