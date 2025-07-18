@@ -1,0 +1,17 @@
+[technote]
+id = "DMTN-271"
+series_id = "DMTN"
+canonical_url = "https://dmtn-271.lsst.io/"
+github_url = "https://github.com/lsst-dm/dmtn-271"
+github_default_branch = "main"
+organization.name = "Vera C. Rubin Observatory"
+organization.ror = "https://ror.org/048g3cy84"
+license.id = "CC-BY-4.0"
+[[technote.authors]]
+name = {given = "James F.", family = "Bosch"}
+internal_id = "boschjf"
+orcid = "https://orcid.org/0000-0003-2759-5764"
+[[technote.authors.affiliations]]
+name = "Department of Astrophysical Sciences"
+internal_id = "Princeton-Astro"
+address = "Princeton University, Princeton, NJ 08544, USA"

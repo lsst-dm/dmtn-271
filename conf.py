@@ -1,9 +1,10 @@
-"""Sphinx configuration.
+# See the Documenteer docs for how to customize conf.py:
+# https://documenteer.lsst.io/technotes/
 
-To learn more about the Sphinx configuration for technotes, and how to
-customize it, see:
+from documenteer.conf.technote import *  # noqa F401 F403
 
-https://documenteer.lsst.io/technotes/configuration.html
-"""
-
-from documenteer.conf.technote import *  # noqa: F401, F403
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", None),
+    "networkx": ("https://networkx.org/documentation/stable", None),
+    "lsst": ("https://pipelines.lsst.io/v/weekly", None),
+}
