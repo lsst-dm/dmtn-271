@@ -7,12 +7,6 @@ Reimagining quantum graphs for post-execution transfers and provenance
    This technote proposes new approaches for ingesting pipeline execution outputs into butler repositories, with two distinct goals: storing input-output provenance in butler repositories (in both prompt processing and batch), and speeding up (and probably spreading out) the work of ingesting batch-processing outputs into the butler database.
    These new approaches center around new in-memory and on-disk data structures for different quantum graphs in different stages of execution.
 
-.. TODO: Delete the note below before merging new content to the main branch.
-
-.. note::
-
-   **This technote is a work-in-progress.**
-
 .. default-domain:: py
 
 .. py:currentmodule:: lsst.pipe.base
