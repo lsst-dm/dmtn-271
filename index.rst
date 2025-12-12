@@ -28,8 +28,8 @@ In batch, we envision something like the following process for generating and ru
   After the provenance graph has been fully written (to a temporary location), it is ingested into the butler.
 
 In prompt processing, we expect small, per-detector predicted quantum graphs to be generated and executed in independent worker pods, just as they are today, and information about the outputs sent via Kafka system to a dedicated service for provenance gathering and ingestion, as is already planned for the near future.
-As part of this proposal, worker pods would also need to send a version of the predicted quantum graph to the service, either via Kafka (if it's small enough) or an S3 put.
-The ingestion service would then use that to append provenance to its own aggregation quantum graph file, rolling over to a new one and ingesting the old one only when the :attr:`~lsst.daf.butler.CollectionType.RUN` collection changes.
+As part of this proposal, worker pods would also need to write a provenance quantum graph (one for each ``{visit, detector}``) to be ingested as well.
+During the following day (but before the embargo period ends), these tiny provenance graphs would be merged into per-:attr:`~lsst.daf.butler.CollectionType.RUN` collection graphs, with the original ones deleted.
 
 Eventually, we will want direct ``pipetask`` executions to operate the same way as BPS (in this and many other ways), but with all steps handled by a single Python command.
 This may be rolled out well after the batch and prompt-processing variants are, especially if provenance-hostile developer use cases for clobbering and restarting with different versions and configuration prove difficult to reconcile with having a single post-execution graph dataset for each :attr:`~lsst.daf.butler.CollectionType.RUN` collection.
@@ -195,18 +195,6 @@ A shallow read of all quanta (e.g. for ``bps transform``) would read different c
 2. Read the complete ``pipeline_graph``, ``thin_graph``, and ``init_quanta`` components.
 3. Use the edge list and minimal node attributes to make a :class:`networkx.DiGraph` of all quanta.
 
-.. _wire-graphs:
-
-Wire Quantum Graphs
--------------------
-
-A "wire" quantum graph is a lightweight version of the predicted graph that can be sent from prompt-processing worker pods to its ingestion service efficiently.
-It does not need to support :class:`~lsst.daf.butler.QuantumBackedButler` and can assume its reader has access to a full butler.
-
-The exact components in a wire quantum graph are still TBD, as they depend on how much information the Prompt Processing ingest service gets from other sources (e.g. does it already know the exact :class:`~pipeline_graph.PipelineGraph` the worker pods are running).
-Because prompt-processing graphs only have a single quantum for each task (and rarely more than one dataset of each type), the expensive components are quite different from the expensive components in a large batch graph, and there is no need to support single-quantum partial reads with multi-block components and address files.
-It is likely the most efficient data structure for a wire graph will just be a single JSON blob, mapped to a single parent Pydantic model that aggregates some of the models used in the predicted graph's components.
-
 .. _provenance-graphs:
 
 Provenance Quantum Graphs
@@ -306,6 +294,18 @@ The aggregator tool in the ``finalJob`` could then replace the original ingested
 
 This complexity suggests that we should just not ingest the provenance quantum graph or run dataset deletion in ``finalJob`` unless there is no possibility of a ``bps restart`` that might re-run tasks (e.g. because all quanta succeeded, or because the user opted out of ``bps restart`` when the submitted the workflow).
 The disadvantage of this approach is that it leaves the data repository in an undesirable state if deletions are not manually run later, with files present that have no representation in the butler database.
+
+Alert Production
+================
+
+In Alert Production, predicted quantum graphs are generated for every ``{visit, detector}`` combination on individual worker pods, and executed within a single Python process.
+Instead of sending these back to some central process that would then have to scan for quantum status, dataset existence, and other provenance information, it makes more sense to have the AP worker pods directly write a small provenance quantum graph directly as a regular butler dataset.
+These datasets would have the same storage class as the batch ``run_provenance`` datasets described in :ref:`provenance-graphs`, with different (``{visit, detector}``) dimensions.
+In order to reduce file counts and improve consistency, the small graphs could then be merged into ``run_provenance`` datasets during the day, prior to the unembargo process.
+
+In order to minimize complexity and disruption, it will probably be better to allow log and metadata datasets to be written and transferred back to the central repository independently (i.e. just as they are now), instead of aggregating those within the temporary small provenvance graphs..
+Rewriting them to be backed by the ``run_provenance`` file can then be done when that aggregation happens in the central data repository.
+A similar alternative would be to record the log and metadata information in both the independent files and the small provenance graphs, with the independent files used to back the butler datasets until the aggregation process.
 
 .. _future-extensions:
 
